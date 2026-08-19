@@ -7,7 +7,21 @@ pkg_check_modules(GPIOD REQUIRED IMPORTED_TARGET libgpiod<2)
 pkg_check_modules(CYAML REQUIRED IMPORTED_TARGET libcyaml)
 find_package(Threads REQUIRED)
 
+set(CONFIG_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/schema/sx1262.schema.json")
+set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(GENERATED_SCHEMA "${GENERATED_DIR}/schema.h")
+add_custom_command(
+    OUTPUT "${GENERATED_SCHEMA}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DINPUT=${CONFIG_SCHEMA}"
+        "-DOUTPUT=${GENERATED_SCHEMA}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake"
+    DEPENDS "${CONFIG_SCHEMA}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake"
+    VERBATIM)
+
 add_library(sx1262 MODULE
+    "${GENERATED_SCHEMA}"
     src/config.c
     src/plugin.c
     src/protocol.c
@@ -16,7 +30,7 @@ set_target_properties(sx1262 PROPERTIES PREFIX "" OUTPUT_NAME "sx1262")
 target_compile_features(sx1262 PRIVATE c_std_11)
 target_compile_definitions(sx1262 PRIVATE _POSIX_C_SOURCE=200809L)
 target_compile_options(sx1262 PRIVATE -Wall -Wextra -Wpedantic -Werror -fvisibility=hidden)
-target_include_directories(sx1262 PRIVATE include src)
+target_include_directories(sx1262 PRIVATE "${GENERATED_DIR}" include src)
 target_link_libraries(sx1262 PRIVATE PkgConfig::GPIOD PkgConfig::CYAML Threads::Threads m)
 
 install(TARGETS sx1262 LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/reticulum-rs")
