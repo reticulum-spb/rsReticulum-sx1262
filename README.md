@@ -5,6 +5,11 @@ stable ABI from `rsReticulum/crates/rns-plugin` and keeps the RNode over-air
 format: one header byte, a four-bit packet sequence and two-frame fragmentation
 for Reticulum packets up to 500 bytes.
 
+`include/rns_plugin.h` is a byte-for-byte vendored copy of
+`rsReticulum/crates/rns-plugin/include/rns_plugin.h`. It is intentionally kept
+inside this repository so the plugin can be built without a neighbouring
+rsReticulum source checkout.
+
 Each plugin instance owns its SPI descriptor, GPIO chips and lines, IRQ thread,
 radio state and reassembly buffer. Multiple configured interfaces therefore do
 not share mutable state. `rx_en` and `tx_en` are optional.
