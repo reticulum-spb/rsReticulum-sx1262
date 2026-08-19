@@ -13,8 +13,13 @@ int main(int argc, char **argv) {
     assert(get_api);
     api = get_api();
     assert(api && api->abi_major == RNS_PLUGIN_ABI_MAJOR);
+    assert(api->abi_minor >= 1);
+    assert(api->info_size >= RNS_PLUGIN_INFO_V1_1_SIZE);
     assert(api->info && api->info->name.len && api->create && api->send && api->destroy);
     assert(memcmp(api->info->name.data, "SX1262 RNode", api->info->name.len) == 0);
+    assert(api->info->config_schema_json.data);
+    assert(api->info->config_schema_json.len > 2);
+    assert(api->info->config_schema_json.data[0] == '{');
     dlclose(library);
     return 0;
 }

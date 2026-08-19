@@ -1,6 +1,7 @@
 #include "rns_plugin.h"
 #include "config.h"
 #include "protocol.h"
+#include "schema.h"
 #include "sx126x.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -159,7 +160,8 @@ static void plugin_destroy(rns_plugin_t *plugin) {
 static const rns_plugin_info_t INFO = {
     .name = RNS_STRING_LITERAL("SX1262 RNode"),
     .version = RNS_STRING_LITERAL("0.1.0"),
-    .description = RNS_STRING_LITERAL("Direct SPI SX1262 interface with RNode-compatible LoRa framing.")
+    .description = RNS_STRING_LITERAL("Direct SPI SX1262 interface with RNode-compatible LoRa framing."),
+    .config_schema_json = { (const uint8_t *) SX1262_CONFIG_SCHEMA, sizeof(SX1262_CONFIG_SCHEMA) - 1 }
 };
 
 static const rns_plugin_api_t API = {
