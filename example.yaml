@@ -19,3 +19,5 @@ interfaces:
       preamble_symbols: 25
       sync_word: 5156 # 0x1424
       tcxo_voltage: 1.8
+      irq_watchdog_seconds: 60
+      hard_reset_after: 2

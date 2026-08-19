@@ -18,6 +18,8 @@ typedef struct {
     uint8_t        spreading_factor, coding_rate, tx_power;
     uint16_t       sync_word;
     double         tcxo_voltage;
+    uint32_t       irq_watchdog_seconds;
+    uint8_t        hard_reset_after;
 } plugin_config_t;
 
 bool config_parse(const uint8_t *, size_t, plugin_config_t **, char *, size_t);

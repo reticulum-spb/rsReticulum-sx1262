@@ -26,10 +26,20 @@ static void radio_log(void *opaque, int level, const char *message) {
     host_log(plugin->host, (rns_log_level_t) level, message);
 }
 
+static void radio_online(void *opaque, bool online) {
+    rns_plugin_t *plugin = opaque;
+
+    plugin->reassembly.sequence = UINT8_C(0xff);
+    plugin->reassembly.length = 0;
+
+    if (atomic_load_explicit(&plugin->committed, memory_order_acquire))
+        plugin->host->set_online(plugin->host->host_context, online ? 1 : 0);
+}
+
 static void radio_receive(void *opaque, const uint8_t *frame, size_t frame_len, int16_t rssi, int16_t snr) {
-    rns_plugin_t     *plugin = opaque;
-    const uint8_t    *packet;
-    size_t            packet_len;
+    rns_plugin_t  *plugin = opaque;
+    const uint8_t *packet;
+    size_t         packet_len;
 
     rns_rx_metadata_t metadata = {
         .valid_fields = RNS_RX_METADATA_RSSI | RNS_RX_METADATA_SNR,
@@ -93,7 +103,7 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
     plugin->reassembly.sequence = UINT8_C(0xff);
     plugin->random_state = (unsigned int) (uintptr_t) plugin;
     atomic_init(&plugin->committed, false);
-    plugin->radio = sx126x_open(config, radio_receive, radio_log, plugin);
+    plugin->radio = sx126x_open(config, radio_receive, radio_log, radio_online, plugin);
     config_free(config);
 
     if (!plugin->radio) {

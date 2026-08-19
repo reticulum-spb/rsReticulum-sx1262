@@ -24,6 +24,8 @@ static const cyaml_schema_field_t config_fields[] = {
     CYAML_FIELD_UINT("preamble_symbols", CYAML_FLAG_OPTIONAL, plugin_config_t, preamble_symbols),
     CYAML_FIELD_UINT("sync_word", CYAML_FLAG_OPTIONAL, plugin_config_t, sync_word),
     CYAML_FIELD_FLOAT("tcxo_voltage", CYAML_FLAG_OPTIONAL, plugin_config_t, tcxo_voltage),
+    CYAML_FIELD_UINT("irq_watchdog_seconds", CYAML_FLAG_OPTIONAL, plugin_config_t, irq_watchdog_seconds),
+    CYAML_FIELD_UINT("hard_reset_after", CYAML_FLAG_OPTIONAL, plugin_config_t, hard_reset_after),
     CYAML_FIELD_END
 };
 
@@ -84,8 +86,15 @@ bool config_parse(const uint8_t *data, size_t len, plugin_config_t **out, char *
     if ((*out)->tcxo_voltage == 0.0)
         (*out)->tcxo_voltage = 1.8;
 
-    if ((*out)->preamble_symbols > UINT16_MAX || (*out)->tcxo_voltage < 1.6 || (*out)->tcxo_voltage > 3.3) {
-        snprintf(error, error_size, "preamble_symbols or tcxo_voltage is out of range");
+    if ((*out)->irq_watchdog_seconds == 0)
+        (*out)->irq_watchdog_seconds = 60;
+
+    if ((*out)->hard_reset_after == 0)
+        (*out)->hard_reset_after = 2;
+
+    if ((*out)->preamble_symbols > UINT16_MAX || (*out)->tcxo_voltage < 1.6 || (*out)->tcxo_voltage > 3.3 ||
+        (*out)->irq_watchdog_seconds > 86400 || (*out)->hard_reset_after > 100) {
+        snprintf(error, error_size, "optional watchdog or radio configuration is out of range");
         config_free(*out);
         *out = NULL;
         return false;

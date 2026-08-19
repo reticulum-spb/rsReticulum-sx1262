@@ -50,8 +50,23 @@ Optional fields and defaults:
 | `preamble_symbols` | 25 |
 | `sync_word` | `0x1424` (write `5156` in YAML) |
 | `tcxo_voltage` | 1.8 V |
+| `irq_watchdog_seconds` | 60 |
+| `hard_reset_after` | 2 |
 
 Allowed TCXO voltages are 1.6, 1.7, 1.8, 2.2, 2.4, 2.7, 3.0 and 3.3 V.
+
+The receive watchdog derives separate PREAMBLE and HEADER deadlines from the
+configured LoRa airtime. On expiry it first polls the SX1262 IRQ register, so a
+packet is still handled when only the DIO1 edge was lost. With no pending IRQ,
+the plugin restarts continuous RX without resetting the chip. After
+`hard_reset_after` consecutive watchdog recoveries, or immediately after a
+failed soft recovery or TX timeout, it toggles RST and reapplies the complete
+radio configuration. A normal DIO1 event clears the recovery counter.
+
+`irq_watchdog_seconds` additionally checks a radio which produces no DIO1
+events at all. The valid range is 1–86400 seconds; `hard_reset_after` is 1–100.
+During a hardware reset the interface transitions offline and returns online
+only after radio initialization succeeds.
 
 ## Runtime behaviour
 

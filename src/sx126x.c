@@ -31,6 +31,12 @@ enum radio_state {
     RADIO_TX
 };
 
+enum rx_progress {
+    RX_WAITING,
+    RX_PREAMBLE,
+    RX_HEADER
+};
+
 struct gpio_handle {
     struct gpiod_chip *chip;
     struct gpiod_line *line;
@@ -46,15 +52,28 @@ struct sx126x {
     atomic_bool        stopping;
     bool               medium_busy;
     enum radio_state   state;
+    enum rx_progress   rx_progress;
     uint32_t           frequency, bandwidth, preamble;
     uint16_t           sync_word;
     uint8_t            sf, cr, power, bw_code, tcxo_code;
     uint64_t           bitrate;
     unsigned int       random_state;
+    uint32_t           irq_watchdog_ms, preamble_timeout_ms, frame_timeout_ms;
+    uint8_t            hard_reset_after, watchdog_strikes;
+    uint64_t           last_dio_ms, rx_deadline_ms;
+    bool               service_online;
     sx126x_rx_fn       receive;
     sx126x_log_fn      log;
+    sx126x_online_fn   online;
     void              *context;
 };
+
+static uint64_t monotonic_ms(void) {
+    struct timespec value;
+
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return (uint64_t) value.tv_sec * UINT64_C(1000) + (uint64_t) value.tv_nsec / UINT64_C(1000000);
+}
 
 static void log_message(sx126x_t *radio, int level, const char *format, ...) {
     char    message[256];
@@ -154,13 +173,15 @@ static bool write_bytes(sx126x_t *radio, const uint8_t *data, size_t len) {
     return spi_transfer(radio, &transfer, 1, len);
 }
 
+static bool wait_busy(sx126x_t *radio, uint32_t timeout_ms);
+
 static bool command_read(sx126x_t *radio, const uint8_t *command, size_t command_len, uint8_t *result, size_t result_len) {
     struct spi_ioc_transfer transfers[2] = {
         { .tx_buf = (uintptr_t) command, .len = (uint32_t) command_len, .speed_hz = 1000000, .bits_per_word = 8 },
         { .rx_buf = (uintptr_t) result,  .len = (uint32_t) result_len,  .speed_hz = 1000000, .bits_per_word = 8 }
     };
 
-    return spi_transfer(radio, transfers, 2, command_len + result_len);
+    return wait_busy(radio, 150) && spi_transfer(radio, transfers, 2, command_len + result_len);
 }
 
 static bool wait_busy(sx126x_t *radio, uint32_t timeout_ms) {
@@ -237,14 +258,15 @@ static bool enter_rx(sx126x_t *radio) {
     return packet_params(radio, 255) && configure_irq(radio) && set_antenna(radio, RADIO_RX) && command(radio, receive, sizeof(receive));
 }
 
-static uint16_t irq_status(sx126x_t *radio) {
+static bool read_irq_status(sx126x_t *radio, uint16_t *status) {
     uint8_t command_data[] = { 0x12 };
     uint8_t response[3] = { 0 };
 
     if (!command_read(radio, command_data, sizeof(command_data), response, sizeof(response)))
-        return 0;
+        return false;
 
-    return (uint16_t) ((uint16_t) response[1] << 8) | response[2];
+    *status = (uint16_t) ((uint16_t) response[1] << 8) | response[2];
+    return true;
 }
 
 static void clear_irq(sx126x_t *radio, uint16_t status) {
@@ -253,24 +275,186 @@ static void clear_irq(sx126x_t *radio, uint16_t status) {
     (void) command(radio, data, sizeof(data));
 }
 
-static void receive_packet(sx126x_t *radio) {
+static bool receive_packet(sx126x_t *radio) {
     uint8_t status_command[] = { 0x13 }, status[3] = { 0 }, read_command[2], response[256];
     uint8_t packet_command[] = { 0x14 }, packet_status[4] = { 0 };
 
-    if (!command_read(radio, status_command, sizeof(status_command), status, sizeof(status)) || status[1] < 2)
-        return;
+    if (!command_read(radio, status_command, sizeof(status_command), status, sizeof(status)))
+        return false;
+
+    if (status[1] < 2)
+        return true;
 
     read_command[0] = 0x1e;
     read_command[1] = status[2];
 
     if (!command_read(radio, read_command, sizeof(read_command), response, (size_t) status[1] + 1))
-        return;
+        return false;
 
     if (!command_read(radio, packet_command, sizeof(packet_command), packet_status, sizeof(packet_status)))
-        return;
+        return false;
 
     if (radio->receive)
         radio->receive(radio->context, response + 1, status[1], (int16_t) (-(int) packet_status[1] / 2), (int16_t) lround((double) (int8_t) packet_status[2] / 4.0));
+
+    return true;
+}
+
+static bool initialize_radio_locked(sx126x_t *radio);
+
+static void set_service_online(sx126x_t *radio, bool online) {
+    if (radio->service_online == online)
+        return;
+
+    radio->service_online = online;
+
+    if (radio->online)
+        radio->online(radio->context, online);
+}
+
+static void reset_rx_progress(sx126x_t *radio) {
+    radio->medium_busy = false;
+    radio->rx_progress = RX_WAITING;
+    radio->rx_deadline_ms = 0;
+    pthread_cond_broadcast(&radio->condition);
+}
+
+static bool soft_recover_locked(sx126x_t *radio, const char *reason) {
+    uint8_t standby[] = { 0x80, 0 };
+
+    log_message(radio, 2, "sx1262: %s, restarting continuous RX", reason);
+    reset_rx_progress(radio);
+
+    if (!command(radio, standby, sizeof(standby)) || !enter_rx(radio)) {
+        log_message(radio, 1, "sx1262: soft RX recovery failed");
+        return false;
+    }
+
+    radio->last_dio_ms = monotonic_ms();
+    return true;
+}
+
+static bool hard_recover_locked(sx126x_t *radio, const char *reason) {
+    log_message(radio, 2, "sx1262: %s, performing hardware reset", reason);
+    set_service_online(radio, false);
+    reset_rx_progress(radio);
+    radio->tx_failed = radio->state == RADIO_TX;
+    pthread_cond_broadcast(&radio->condition);
+    radio->last_dio_ms = monotonic_ms();
+
+    if (!initialize_radio_locked(radio)) {
+        radio->state = RADIO_IDLE;
+        log_message(radio, 1, "sx1262: hardware reset and reinitialization failed");
+        return false;
+    }
+
+    radio->watchdog_strikes = 0;
+    radio->last_dio_ms = monotonic_ms();
+    set_service_online(radio, true);
+    log_message(radio, 3, "sx1262: radio recovered and online");
+    return true;
+}
+
+static bool recover_locked(sx126x_t *radio, const char *reason) {
+    radio->watchdog_strikes++;
+
+    if (radio->watchdog_strikes >= radio->hard_reset_after)
+        return hard_recover_locked(radio, reason);
+
+    if (soft_recover_locked(radio, reason))
+        return true;
+
+    return hard_recover_locked(radio, reason);
+}
+
+static void handle_irq_status_locked(sx126x_t *radio, uint16_t status) {
+    uint64_t now = monotonic_ms();
+    bool     terminal = (status & (IRQ_HEADER_ERR | IRQ_RX_DONE | IRQ_CRC_ERR | IRQ_TIMEOUT)) != 0;
+
+    if (status & IRQ_PREAMBLE) {
+        radio->medium_busy = true;
+        radio->rx_progress = RX_PREAMBLE;
+        radio->rx_deadline_ms = now + radio->preamble_timeout_ms;
+        pthread_cond_broadcast(&radio->condition);
+    }
+
+    if (status & IRQ_HEADER_VALID) {
+        radio->medium_busy = true;
+        radio->rx_progress = RX_HEADER;
+        radio->rx_deadline_ms = now + radio->frame_timeout_ms;
+        pthread_cond_broadcast(&radio->condition);
+    }
+
+    if ((status & IRQ_RX_DONE) && !(status & IRQ_CRC_ERR) && !receive_packet(radio)) {
+        (void) hard_recover_locked(radio, "SPI failure while reading received packet");
+        return;
+    }
+
+    if (status & IRQ_TX_DONE) {
+        radio->tx_done = true;
+        pthread_cond_broadcast(&radio->condition);
+    }
+
+    if (status & (IRQ_TIMEOUT | IRQ_HEADER_ERR)) {
+        radio->tx_failed = radio->state == RADIO_TX;
+        pthread_cond_broadcast(&radio->condition);
+    }
+
+    clear_irq(radio, status);
+
+    if (terminal) {
+        reset_rx_progress(radio);
+
+        if (radio->state != RADIO_TX && !enter_rx(radio))
+            (void) hard_recover_locked(radio, "cannot return to RX after IRQ");
+    }
+}
+
+static void watchdog_locked(sx126x_t *radio) {
+    uint64_t now = monotonic_ms();
+    uint16_t status;
+
+    if (radio->state == RADIO_TX)
+        return;
+
+    if (radio->rx_deadline_ms != 0 && now >= radio->rx_deadline_ms) {
+        if (!read_irq_status(radio, &status)) {
+            (void) hard_recover_locked(radio, "SPI failure while polling RX deadline");
+            return;
+        }
+
+        if (status != 0) {
+            log_message(radio, 2, "sx1262: polled pending IRQ 0x%04x after RX deadline", status);
+            handle_irq_status_locked(radio, status);
+        }
+
+        if (radio->rx_progress != RX_WAITING)
+            (void) recover_locked(radio, radio->rx_progress == RX_HEADER ? "RX frame timeout after HEADER_VALID" : "RX header timeout after PREAMBLE_DETECTED");
+
+        return;
+    }
+
+    if (radio->irq_watchdog_ms == 0 || now - radio->last_dio_ms < radio->irq_watchdog_ms)
+        return;
+
+    if (!read_irq_status(radio, &status)) {
+        (void) hard_recover_locked(radio, "SPI failure while polling DIO1 watchdog");
+        return;
+    }
+    radio->last_dio_ms = now;
+
+    if (status != 0) {
+        log_message(radio, 2, "sx1262: pending IRQ 0x%04x found without DIO1 event", status);
+        handle_irq_status_locked(radio, status);
+        radio->watchdog_strikes++;
+
+        if (radio->watchdog_strikes >= radio->hard_reset_after)
+            (void) hard_recover_locked(radio, "repeated lost DIO1 events");
+
+        return;
+    }
+
+    (void) recover_locked(radio, "DIO1 watchdog expired");
 }
 
 static void *irq_worker(void *opaque) {
@@ -280,8 +464,17 @@ static void *irq_worker(void *opaque) {
         struct timespec timeout = { .tv_sec = 0, .tv_nsec = 100000000L };
         int             ready = gpiod_line_event_wait(radio->dio1.line, &timeout);
 
-        if (ready <= 0)
+        if (ready < 0) {
+            log_message(radio, 1, "sx1262: DIO1 event wait failed");
             continue;
+        }
+
+        if (ready == 0) {
+            pthread_mutex_lock(&radio->mutex);
+            watchdog_locked(radio);
+            pthread_mutex_unlock(&radio->mutex);
+            continue;
+        }
 
         struct gpiod_line_event event;
 
@@ -291,35 +484,14 @@ static void *irq_worker(void *opaque) {
         pthread_mutex_lock(&radio->mutex);
 
         if (!atomic_load_explicit(&radio->stopping, memory_order_acquire)) {
-            uint16_t status = irq_status(radio);
+            uint16_t status;
+            radio->last_dio_ms = monotonic_ms();
+            radio->watchdog_strikes = 0;
 
-            if (status & (IRQ_PREAMBLE | IRQ_HEADER_VALID)) {
-                radio->medium_busy = true;
-                pthread_cond_broadcast(&radio->condition);
-            }
-
-            if (status & (IRQ_HEADER_ERR | IRQ_RX_DONE | IRQ_CRC_ERR | IRQ_TIMEOUT)) {
-                radio->medium_busy = false;
-                pthread_cond_broadcast(&radio->condition);
-            }
-
-            if ((status & IRQ_RX_DONE) && !(status & IRQ_CRC_ERR))
-                receive_packet(radio);
-
-            if (status & IRQ_TX_DONE) {
-                radio->tx_done = true;
-                pthread_cond_broadcast(&radio->condition);
-            }
-
-            if (status & (IRQ_TIMEOUT | IRQ_HEADER_ERR)) {
-                radio->tx_failed = radio->state == RADIO_TX;
-                pthread_cond_broadcast(&radio->condition);
-            }
-
-            clear_irq(radio, status);
-
-            if (radio->state != RADIO_TX)
-                (void) enter_rx(radio);
+            if (read_irq_status(radio, &status))
+                handle_irq_status_locked(radio, status);
+            else
+                (void) hard_recover_locked(radio, "SPI failure while reading DIO1 IRQ");
         }
         pthread_mutex_unlock(&radio->mutex);
     }
@@ -378,7 +550,7 @@ static bool map_tcxo(double voltage, uint8_t *code) {
     return false;
 }
 
-sx126x_t *sx126x_open(const plugin_config_t *config, sx126x_rx_fn receive, sx126x_log_fn log, void *context) {
+sx126x_t *sx126x_open(const plugin_config_t *config, sx126x_rx_fn receive, sx126x_log_fn log, sx126x_online_fn online, void *context) {
     sx126x_t *radio = calloc(1, sizeof(*radio));
 
     if (!radio)
@@ -394,14 +566,30 @@ sx126x_t *sx126x_open(const plugin_config_t *config, sx126x_rx_fn receive, sx126
     radio->sf = config->spreading_factor;
     radio->cr = config->coding_rate;
     radio->power = config->tx_power;
+    radio->irq_watchdog_ms = config->irq_watchdog_seconds * UINT32_C(1000);
+    radio->hard_reset_after = config->hard_reset_after;
     radio->receive = receive;
     radio->log = log;
+    radio->online = online;
     radio->context = context;
 
     if (!map_bandwidth(config->bandwidth, &radio->bw_code) || !map_tcxo(config->tcxo_voltage, &radio->tcxo_code))
         goto fail;
 
     radio->bitrate = (uint64_t) ((double) radio->sf * (4.0 / radio->cr) / ((double) (UINT32_C(1) << radio->sf) / ((double) radio->bandwidth / 1000.0)) * 1000.0);
+    double   symbol_ms = pow(2.0, radio->sf) / radio->bandwidth * 1000.0;
+    uint32_t preamble_ms = (uint32_t) ceil((radio->preamble + 4.25) * symbol_ms);
+    uint32_t total_ms = sx126x_airtime_ms(radio, 255);
+    uint32_t payload_ms = total_ms > preamble_ms ? total_ms - preamble_ms : total_ms;
+    radio->preamble_timeout_ms = preamble_ms * 3 / 2 + 25;
+    radio->frame_timeout_ms = payload_ms * 3 / 2 + 25;
+
+    if (radio->preamble_timeout_ms < 100)
+        radio->preamble_timeout_ms = 100;
+
+    if (radio->frame_timeout_ms < 100)
+        radio->frame_timeout_ms = 100;
+
     radio->spi_fd = open(config->spi, O_RDWR | O_CLOEXEC);
 
     if (radio->spi_fd < 0)
@@ -428,7 +616,7 @@ fail:
     return NULL;
 }
 
-bool sx126x_start(sx126x_t *radio) {
+static bool initialize_radio_locked(sx126x_t *radio) {
     uint8_t  standby[] = { 0x80, 0 }, packet_type[] = { 0x8a, 1 }, base[] = { 0x8f, 0, 0 };
     uint8_t  tcxo[] = { 0x97, radio->tcxo_code, 0, 5, 0x60 };
     uint64_t frf = (uint64_t) radio->frequency * UINT64_C(33554432) / UINT64_C(32000000);
@@ -439,10 +627,17 @@ bool sx126x_start(sx126x_t *radio) {
     uint8_t  regulator[] = { 0x96, radio->power > 22 ? 1 : 0x11 };
     uint8_t  tx_params[] = { 0x8e, (uint8_t) (radio->power - 17), 4 };
 
-    gpiod_line_set_value(radio->rst.line, 0);
+    if (gpiod_line_set_value(radio->rst.line, 0) < 0)
+        return false;
+
     sleep_us(10000);
-    gpiod_line_set_value(radio->rst.line, 1);
+
+    if (gpiod_line_set_value(radio->rst.line, 1) < 0)
+        return false;
+
     sleep_us(10000);
+
+    reset_rx_progress(radio);
 
     if (!command(radio, standby, sizeof(standby)) || !command(radio, packet_type, sizeof(packet_type)) || !command(radio, base, sizeof(base)) ||
         !command(radio, tcxo, sizeof(tcxo)) || !command(radio, frequency, sizeof(frequency)) || !command(radio, modulation, sizeof(modulation)) ||
@@ -450,10 +645,19 @@ bool sx126x_start(sx126x_t *radio) {
         !command(radio, regulator, sizeof(regulator)) || !command(radio, tx_params, sizeof(tx_params)) || !enter_rx(radio))
         return false;
 
+    radio->last_dio_ms = monotonic_ms();
+    return true;
+}
+
+bool sx126x_start(sx126x_t *radio) {
+    if (!initialize_radio_locked(radio))
+        return false;
+
     if (pthread_create(&radio->irq_thread, NULL, irq_worker, radio) != 0)
         return false;
 
     radio->thread_started = true;
+    radio->service_online = true;
 
     return true;
 }
@@ -461,6 +665,7 @@ bool sx126x_start(sx126x_t *radio) {
 bool sx126x_send(sx126x_t *radio, const uint8_t *data, size_t len, uint32_t timeout_ms) {
     uint8_t buffer[257], transmit[] = { 0x83, 0, 0, 0 };
     bool    success = false;
+    bool    attempted = false;
 
     if (!radio || !data || len < 2 || len > 255)
         return false;
@@ -494,6 +699,7 @@ bool sx126x_send(sx126x_t *radio, const uint8_t *data, size_t len, uint32_t time
     memcpy(buffer + 2, data, len);
     radio->tx_done = false;
     radio->tx_failed = false;
+    attempted = true;
 
     if (!command(radio, buffer, len + 2) || !packet_params(radio, (uint8_t) len) || !configure_irq(radio) || !set_antenna(radio, RADIO_TX) || !command(radio, transmit, sizeof(transmit)))
         goto done;
@@ -509,6 +715,9 @@ bool sx126x_send(sx126x_t *radio, const uint8_t *data, size_t len, uint32_t time
     if (!enter_rx(radio))
         success = false;
 done:
+    if (attempted && !success)
+        (void) hard_recover_locked(radio, "TX command or TX_DONE timeout");
+
     pthread_mutex_unlock(&radio->mutex);
 
     return success;
