@@ -34,7 +34,7 @@ when appropriate.
 ## Configuration
 
 The plugin embeds an ABI 1.1 JSON Schema for its complete configuration. Its
-readable source is `schema/sx1262.schema.json`; CMake converts it to a byte
+readable source is `schema/schema.json`; CMake converts it to a byte
 array in the build directory and compiles that into `sx1262.so`, without extra
 build-time tools. The rsReticulum web UI reads this metadata directly from the
 library and builds the editor from it; there is no host-side fallback or

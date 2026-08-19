@@ -7,9 +7,9 @@ pkg_check_modules(GPIOD REQUIRED IMPORTED_TARGET libgpiod<2)
 pkg_check_modules(CYAML REQUIRED IMPORTED_TARGET libcyaml)
 find_package(Threads REQUIRED)
 
-set(CONFIG_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/schema/sx1262.schema.json")
+set(CONFIG_SCHEMA "${CMAKE_CURRENT_SOURCE_DIR}/schema/schema.json")
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-set(GENERATED_SCHEMA "${GENERATED_DIR}/schema.h")
+set(GENERATED_SCHEMA "${GENERATED_DIR}/config_schema.h")
 add_custom_command(
     OUTPUT "${GENERATED_SCHEMA}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_DIR}"
