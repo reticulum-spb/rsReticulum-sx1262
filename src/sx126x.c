@@ -41,6 +41,7 @@ struct sx126x {
     uint16_t sync_word;
     uint8_t sf, cr, power, bw_code, tcxo_code;
     uint64_t bitrate;
+    unsigned int random_state;
     sx126x_rx_fn receive;
     sx126x_log_fn log;
     void *context;
@@ -166,7 +167,10 @@ static void *irq_worker(void *opaque) {
         pthread_mutex_lock(&radio->mutex);
         if (!atomic_load_explicit(&radio->stopping,memory_order_acquire)) {
             uint16_t status=irq_status(radio);
-            if (status&(IRQ_PREAMBLE|IRQ_HEADER_VALID)) radio->medium_busy=true;
+            if (status&(IRQ_PREAMBLE|IRQ_HEADER_VALID)) {
+                radio->medium_busy=true;
+                pthread_cond_broadcast(&radio->condition);
+            }
             if (status&(IRQ_HEADER_ERR|IRQ_RX_DONE|IRQ_CRC_ERR|IRQ_TIMEOUT)) {
                 radio->medium_busy=false;
                 pthread_cond_broadcast(&radio->condition);
@@ -201,6 +205,7 @@ sx126x_t *sx126x_open(const plugin_config_t *config, sx126x_rx_fn receive,
     sx126x_t *radio=calloc(1,sizeof(*radio));
     if(!radio)return NULL;
     atomic_init(&radio->stopping,false);
+    radio->random_state=(unsigned int)(uintptr_t)radio^(unsigned int)time(NULL);
     radio->spi_fd=-1; radio->frequency=config->frequency; radio->bandwidth=config->bandwidth;
     radio->preamble=config->preamble_symbols; radio->sync_word=config->sync_word; radio->sf=config->spreading_factor;
     radio->cr=config->coding_rate; radio->power=config->tx_power; radio->receive=receive; radio->log=log; radio->context=context;
@@ -244,8 +249,16 @@ bool sx126x_send(sx126x_t *radio,const uint8_t *data,size_t len,uint32_t timeout
     if(!radio||!data||len<2||len>255)return false;
     pthread_mutex_lock(&radio->mutex);
     struct timespec medium_deadline=deadline_ms(timeout_ms);
-    while(radio->medium_busy&&!atomic_load_explicit(&radio->stopping,memory_order_acquire))
-        if(pthread_cond_timedwait(&radio->condition,&radio->mutex,&medium_deadline)==ETIMEDOUT)goto done;
+    for (;;) {
+        while(radio->medium_busy&&!atomic_load_explicit(&radio->stopping,memory_order_acquire))
+            if(pthread_cond_timedwait(&radio->condition,&radio->mutex,&medium_deadline)==ETIMEDOUT)goto done;
+        if(atomic_load_explicit(&radio->stopping,memory_order_acquire))goto done;
+        uint32_t contention_ms=(rand_r(&radio->random_state)%15u)*24u;
+        if(contention_ms==0)break;
+        struct timespec contention_deadline=deadline_ms(contention_ms);
+        int wait_result=pthread_cond_timedwait(&radio->condition,&radio->mutex,&contention_deadline);
+        if(wait_result==ETIMEDOUT&&!radio->medium_busy)break;
+    }
     buffer[0]=0x0e;buffer[1]=0;memcpy(buffer+2,data,len);radio->tx_done=false;radio->tx_failed=false;
     if(!command(radio,buffer,len+2)||!packet_params(radio,(uint8_t)len)||!configure_irq(radio)||!set_antenna(radio,RADIO_TX)||!command(radio,transmit,sizeof(transmit)))goto done;
     struct timespec deadline=deadline_ms(timeout_ms);
