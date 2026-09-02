@@ -69,7 +69,7 @@ bool config_parse(const uint8_t *data, size_t len, plugin_config_t **out, char *
     if (!*out || !(*out)->spi || (*out)->frequency < 150000000 || (*out)->frequency > 960000000 ||
         !bandwidth_valid((*out)->bandwidth) || (*out)->spreading_factor < 5 ||
         (*out)->spreading_factor > 12 || (*out)->coding_rate < 4 || (*out)->coding_rate > 8 ||
-        (*out)->tx_power < 8 || (*out)->tx_power > 30) {
+        (*out)->tx_power > 30) {
         snprintf(error, error_size, "missing or out-of-range radio configuration");
         config_free(*out);
         *out = NULL;
