@@ -41,6 +41,7 @@ static void radio_receive(void *opaque, const uint8_t *frame, size_t frame_len, 
     rns_plugin_t  *plugin = opaque;
     const uint8_t *packet;
     size_t         packet_len;
+    char           message[128];
 
     rns_rx_metadata_t metadata = {
         .valid_fields = RNS_RX_METADATA_RSSI | RNS_RX_METADATA_SNR,
@@ -51,8 +52,12 @@ static void radio_receive(void *opaque, const uint8_t *frame, size_t frame_len, 
     if (!atomic_load_explicit(&plugin->committed, memory_order_acquire))
         return;
 
-    if (rns_reassemble(&plugin->reassembly, frame, frame_len, &packet, &packet_len))
+    if (rns_reassemble(&plugin->reassembly, frame, frame_len, &packet, &packet_len)) {
+        snprintf(message, sizeof(message), "sx1262: RX packet received: %zu bytes, RSSI %d dBm, SNR %d dB",
+                 packet_len, (int) rssi, (int) snr);
+        host_log(plugin->host, RNS_LOG_DEBUG, message);
         plugin->host->rx_packet(plugin->host->host_context, packet, packet_len, &metadata, sizeof(metadata));
+    }
 }
 
 typedef struct {
@@ -62,19 +67,33 @@ typedef struct {
 
 static void transmit_frame(void *opaque, const uint8_t *frame, size_t frame_len) {
     tx_context_t *tx = opaque;
+    uint32_t      airtime;
     uint32_t      timeout;
+    char          message[128];
 
     if (!tx->success)
         return;
 
-    timeout = sx126x_airtime_ms(tx->plugin->radio, frame_len) * 2 + 500;
+    airtime = sx126x_airtime_ms(tx->plugin->radio, frame_len);
+    timeout = airtime * 2 + 500;
     tx->success = sx126x_send(tx->plugin->radio, frame, frame_len, timeout);
+
+    if (tx->success) {
+        snprintf(message, sizeof(message), "sx1262: TX frame transmitted: %zu bytes, airtime %u ms, timeout %u ms",
+                 frame_len, (unsigned int) airtime, (unsigned int) timeout);
+        host_log(tx->plugin->host, RNS_LOG_DEBUG, message);
+    } else {
+        snprintf(message, sizeof(message), "sx1262: TX frame failed: %zu bytes, airtime %u ms, timeout %u ms",
+                 frame_len, (unsigned int) airtime, (unsigned int) timeout);
+        host_log(tx->plugin->host, RNS_LOG_WARN, message);
+    }
 }
 
 static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8_t *yaml, size_t yaml_len, rns_plugin_t **out) {
     plugin_config_t *config = NULL;
     rns_plugin_t    *plugin = NULL;
     char             error[256];
+    char             message[256];
 
     if (!host || !out)
         return RNS_PLUGIN_ERROR;
@@ -105,10 +124,10 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
     plugin->random_state = (unsigned int) (uintptr_t) plugin;
     atomic_init(&plugin->committed, false);
     plugin->radio = sx126x_open(config, radio_receive, radio_log, radio_online, plugin);
-    config_free(config);
 
     if (!plugin->radio) {
         host_log(host, RNS_LOG_ERROR, "sx1262: cannot open SPI or GPIO resources");
+        config_free(config);
         free(plugin);
         return RNS_PLUGIN_ERROR;
     }
@@ -116,9 +135,18 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
     if (!sx126x_start(plugin->radio)) {
         host_log(host, RNS_LOG_ERROR, "sx1262: radio initialization failed");
         sx126x_close(plugin->radio);
+        config_free(config);
         free(plugin);
         return RNS_PLUGIN_ERROR;
     }
+
+    snprintf(message, sizeof(message),
+             "sx1262: radio started: %u Hz, BW %u Hz, SF%u, CR 4/%u, TX %u dBm, bitrate %llu bps",
+             (unsigned int) config->frequency, (unsigned int) config->bandwidth,
+             (unsigned int) config->spreading_factor, (unsigned int) config->coding_rate,
+             (unsigned int) config->tx_power, (unsigned long long) sx126x_bitrate(plugin->radio));
+    host_log(host, RNS_LOG_DEBUG, message);
+    config_free(config);
 
     host->set_bitrate(host->host_context, sx126x_bitrate(plugin->radio));
     host->set_online(host->host_context, 1);
@@ -132,6 +160,7 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
 static rns_plugin_result_t plugin_send(rns_plugin_t *plugin, const uint8_t *data, size_t len) {
     tx_context_t tx = { .plugin = plugin, .success = true };
     uint8_t      sequence;
+    char         message[128];
 
     if (!plugin || !data || len == 0 || len > RNS_PROTOCOL_MTU)
         return RNS_PLUGIN_ERROR;
@@ -142,6 +171,9 @@ static rns_plugin_result_t plugin_send(rns_plugin_t *plugin, const uint8_t *data
         host_log(plugin->host, RNS_LOG_ERROR, "sx1262: physical transmission failed or timed out");
         return RNS_PLUGIN_ERROR;
     }
+
+    snprintf(message, sizeof(message), "SX1262: TX packet transmitted: %zu bytes", len);
+    host_log(plugin->host, RNS_LOG_DEBUG, message);
 
     return RNS_PLUGIN_OK;
 }
