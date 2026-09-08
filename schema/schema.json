@@ -121,9 +121,9 @@
     "tx_power": {
       "type": "integer",
       "title": "TX power",
-      "minimum": 8,
-      "maximum": 30,
-      "default": 22,
+      "minimum": -9,
+      "maximum": 22,
+      "default": 4,
       "x-unit": "dBm",
       "x-ui-group": "Radio",
       "x-order": 50
@@ -150,7 +150,7 @@
       "type": "number",
       "title": "TCXO voltage",
       "enum": [1.6, 1.7, 1.8, 2.2, 2.4, 2.7, 3.0, 3.3],
-      "default": 1.8,
+      "default": 2.2,
       "x-unit": "V",
       "x-ui-group": "Protocol",
       "x-order": 30

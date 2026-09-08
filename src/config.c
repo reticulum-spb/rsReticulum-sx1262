@@ -20,7 +20,7 @@ static const cyaml_schema_field_t config_fields[] = {
     CYAML_FIELD_UINT("bandwidth", CYAML_FLAG_DEFAULT, plugin_config_t, bandwidth),
     CYAML_FIELD_UINT("spreading_factor", CYAML_FLAG_DEFAULT, plugin_config_t, spreading_factor),
     CYAML_FIELD_UINT("coding_rate", CYAML_FLAG_DEFAULT, plugin_config_t, coding_rate),
-    CYAML_FIELD_UINT("tx_power", CYAML_FLAG_DEFAULT, plugin_config_t, tx_power),
+    CYAML_FIELD_INT("tx_power", CYAML_FLAG_DEFAULT, plugin_config_t, tx_power),
     CYAML_FIELD_UINT("preamble_symbols", CYAML_FLAG_OPTIONAL, plugin_config_t, preamble_symbols),
     CYAML_FIELD_UINT("sync_word", CYAML_FLAG_OPTIONAL, plugin_config_t, sync_word),
     CYAML_FIELD_FLOAT("tcxo_voltage", CYAML_FLAG_OPTIONAL, plugin_config_t, tcxo_voltage),
@@ -69,7 +69,7 @@ bool config_parse(const uint8_t *data, size_t len, plugin_config_t **out, char *
     if (!*out || !(*out)->spi || (*out)->frequency < 150000000 || (*out)->frequency > 960000000 ||
         !bandwidth_valid((*out)->bandwidth) || (*out)->spreading_factor < 5 ||
         (*out)->spreading_factor > 12 || (*out)->coding_rate < 4 || (*out)->coding_rate > 8 ||
-        (*out)->tx_power > 30) {
+        (*out)->tx_power < -9 || (*out)->tx_power > 22) {
         snprintf(error, error_size, "missing or out-of-range radio configuration");
         config_free(*out);
         *out = NULL;
@@ -84,7 +84,7 @@ bool config_parse(const uint8_t *data, size_t len, plugin_config_t **out, char *
         (*out)->sync_word = UINT16_C(0x1424);
 
     if ((*out)->tcxo_voltage == 0.0)
-        (*out)->tcxo_voltage = 1.8;
+        (*out)->tcxo_voltage = 2.2;
 
     if ((*out)->irq_watchdog_seconds == 0)
         (*out)->irq_watchdog_seconds = 60;
