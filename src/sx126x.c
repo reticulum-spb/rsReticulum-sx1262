@@ -226,7 +226,7 @@ static bool set_antenna(sx126x_t *radio, enum radio_state state) {
     if (radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 0) < 0)
         return false;
 
-    sleep_us(100);
+    sleep_us(2000);
 
     if (state == RADIO_RX && radio->rx_en.line && gpiod_line_set_value(radio->rx_en.line, 1) < 0)
         return false;
@@ -623,9 +623,14 @@ static bool initialize_radio_locked(sx126x_t *radio) {
     uint8_t  frequency[] = { 0x86, (uint8_t) (frf >> 24), (uint8_t) (frf >> 16), (uint8_t) (frf >> 8), (uint8_t) frf };
     uint8_t  modulation[] = { 0x8b, radio->sf, radio->bw_code, (uint8_t) (radio->cr - 4), 0, 0, 0, 0, 0 };
     uint8_t  sync[] = { (uint8_t) (radio->sync_word >> 8), (uint8_t) radio->sync_word };
-    uint8_t  pa[] = { 0x95, 4, 7, 0, 1 }, ocp[] = { radio->power > 22 ? 0x38 : 0x18 };
-    uint8_t  regulator[] = { 0x96, radio->power > 22 ? 1 : 0x11 };
-    uint8_t  tx_params[] = { 0x8e, (uint8_t) (radio->power - 17), 4 };
+    uint8_t  pa[] = { 0x95, 4, 7, 0, 1 }, ocp[] = { 0x38 };
+    // LDO is the SX1262's low-dropout linear regulator; DC-DC is its more efficient switching regulator,
+    // used together with the internal LDOs. LDO-only mode nearly doubles the SX1262 RX/TX supply current,
+    // while DC-DC+LDO reduces chip-side consumption. On the E22-900M30S this setting controls only the
+    // SX1262 core, not the module's external PA/LNA, so it affects efficiency and current draw but does not
+    // select the external PA or set its RF output power.
+    uint8_t  regulator[] = { 0x96, 0x01 };
+    uint8_t  tx_params[] = { 0x8e, (uint8_t) radio->power, 4 };
 
     if (gpiod_line_set_value(radio->rst.line, 0) < 0)
         return false;
@@ -639,10 +644,18 @@ static bool initialize_radio_locked(sx126x_t *radio) {
 
     reset_rx_progress(radio);
 
-    if (!command(radio, standby, sizeof(standby)) || !command(radio, packet_type, sizeof(packet_type)) || !command(radio, base, sizeof(base)) ||
-        !command(radio, tcxo, sizeof(tcxo)) || !command(radio, frequency, sizeof(frequency)) || !command(radio, modulation, sizeof(modulation)) ||
-        !write_register(radio, REG_SYNC_WORD, sync, sizeof(sync)) || !command(radio, pa, sizeof(pa)) || !write_register(radio, REG_OCP, ocp, sizeof(ocp)) ||
-        !command(radio, regulator, sizeof(regulator)) || !command(radio, tx_params, sizeof(tx_params)) || !enter_rx(radio))
+    if (!command(radio, standby, sizeof(standby)) ||
+        !command(radio, packet_type, sizeof(packet_type)) ||
+        !command(radio, base, sizeof(base)) ||
+        !command(radio, tcxo, sizeof(tcxo)) ||
+        !command(radio, frequency, sizeof(frequency)) ||
+        !command(radio, modulation, sizeof(modulation)) ||
+        !write_register(radio, REG_SYNC_WORD, sync, sizeof(sync)) ||
+        !command(radio, pa, sizeof(pa)) ||
+        !write_register(radio, REG_OCP, ocp, sizeof(ocp)) ||
+        !command(radio, regulator, sizeof(regulator)) ||
+        !command(radio, tx_params, sizeof(tx_params)) ||
+        !enter_rx(radio))
         return false;
 
     radio->last_dio_ms = monotonic_ms();

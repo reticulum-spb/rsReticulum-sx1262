@@ -84,7 +84,7 @@ bool config_parse(const uint8_t *data, size_t len, plugin_config_t **out, char *
         (*out)->sync_word = UINT16_C(0x1424);
 
     if ((*out)->tcxo_voltage == 0.0)
-        (*out)->tcxo_voltage = 1.8;
+        (*out)->tcxo_voltage = 2.2;
 
     if ((*out)->irq_watchdog_seconds == 0)
         (*out)->irq_watchdog_seconds = 60;
