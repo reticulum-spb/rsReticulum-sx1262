@@ -15,7 +15,8 @@ typedef struct {
     gpio_config_t  cs, rst, busy, dio1;
     gpio_config_t *rx_en, *tx_en;
     uint32_t       frequency, bandwidth, preamble_symbols;
-    uint8_t        spreading_factor, coding_rate, tx_power;
+    uint8_t        spreading_factor, coding_rate;
+    int8_t         tx_power;
     uint16_t       sync_word;
     double         tcxo_voltage;
     uint32_t       irq_watchdog_seconds;

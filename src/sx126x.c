@@ -24,6 +24,8 @@
 #define IRQ_MASK         (IRQ_TX_DONE | IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_HEADER_VALID | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT)
 #define REG_SYNC_WORD    UINT16_C(0x0740)
 #define REG_OCP          UINT16_C(0x08e7)
+#define RF_SWITCH_DEAD_TIME_US 100L
+#define E22_TX_WAKEUP_TIME_US  2000L
 
 enum radio_state {
     RADIO_IDLE,
@@ -55,7 +57,8 @@ struct sx126x {
     enum rx_progress   rx_progress;
     uint32_t           frequency, bandwidth, preamble;
     uint16_t           sync_word;
-    uint8_t            sf, cr, power, bw_code, tcxo_code;
+    uint8_t            sf, cr, bw_code, tcxo_code;
+    int8_t             power;
     uint64_t           bitrate;
     unsigned int       random_state;
     uint32_t           irq_watchdog_ms, preamble_timeout_ms, frame_timeout_ms;
@@ -226,13 +229,19 @@ static bool set_antenna(sx126x_t *radio, enum radio_state state) {
     if (radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 0) < 0)
         return false;
 
-    sleep_us(2000);
+    // Keep both paths disabled briefly to prevent RX/TX switch overlap.
+    sleep_us(RF_SWITCH_DEAD_TIME_US);
 
     if (state == RADIO_RX && radio->rx_en.line && gpiod_line_set_value(radio->rx_en.line, 1) < 0)
         return false;
 
-    if (state == RADIO_TX && radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 1) < 0)
-        return false;
+    if (state == RADIO_TX && radio->tx_en.line) {
+        if (gpiod_line_set_value(radio->tx_en.line, 1) < 0)
+            return false;
+
+        // E22-900M30S requires at least 2 ms from TXEN assertion to the start of RF transmission.
+        sleep_us(E22_TX_WAKEUP_TIME_US);
+    }
 
     radio->state = state;
 
