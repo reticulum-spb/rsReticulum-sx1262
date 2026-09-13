@@ -15,9 +15,9 @@ interfaces:
       bandwidth: 125000
       spreading_factor: 7
       coding_rate: 5
-      tx_power: 22
+      tx_power: 4
       preamble_symbols: 25
       sync_word: 5156 # 0x1424
-      tcxo_voltage: 1.8
+      tcxo_voltage: 2.2
       irq_watchdog_seconds: 60
       hard_reset_after: 2

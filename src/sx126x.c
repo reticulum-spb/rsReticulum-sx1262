@@ -24,6 +24,8 @@
 #define IRQ_MASK         (IRQ_TX_DONE | IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_HEADER_VALID | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT)
 #define REG_SYNC_WORD    UINT16_C(0x0740)
 #define REG_OCP          UINT16_C(0x08e7)
+#define RF_SWITCH_DEAD_TIME_US 100L
+#define E22_TX_WAKEUP_TIME_US  2000L
 
 enum radio_state {
     RADIO_IDLE,
@@ -55,7 +57,8 @@ struct sx126x {
     enum rx_progress   rx_progress;
     uint32_t           frequency, bandwidth, preamble;
     uint16_t           sync_word;
-    uint8_t            sf, cr, power, bw_code, tcxo_code;
+    uint8_t            sf, cr, bw_code, tcxo_code;
+    int8_t             power;
     uint64_t           bitrate;
     unsigned int       random_state;
     uint32_t           irq_watchdog_ms, preamble_timeout_ms, frame_timeout_ms;
@@ -226,13 +229,19 @@ static bool set_antenna(sx126x_t *radio, enum radio_state state) {
     if (radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 0) < 0)
         return false;
 
-    sleep_us(100);
+    // Keep both paths disabled briefly to prevent RX/TX switch overlap.
+    sleep_us(RF_SWITCH_DEAD_TIME_US);
 
     if (state == RADIO_RX && radio->rx_en.line && gpiod_line_set_value(radio->rx_en.line, 1) < 0)
         return false;
 
-    if (state == RADIO_TX && radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 1) < 0)
-        return false;
+    if (state == RADIO_TX && radio->tx_en.line) {
+        if (gpiod_line_set_value(radio->tx_en.line, 1) < 0)
+            return false;
+
+        // E22-900M30S requires at least 2 ms from TXEN assertion to the start of RF transmission.
+        sleep_us(E22_TX_WAKEUP_TIME_US);
+    }
 
     radio->state = state;
 
@@ -623,9 +632,14 @@ static bool initialize_radio_locked(sx126x_t *radio) {
     uint8_t  frequency[] = { 0x86, (uint8_t) (frf >> 24), (uint8_t) (frf >> 16), (uint8_t) (frf >> 8), (uint8_t) frf };
     uint8_t  modulation[] = { 0x8b, radio->sf, radio->bw_code, (uint8_t) (radio->cr - 4), 0, 0, 0, 0, 0 };
     uint8_t  sync[] = { (uint8_t) (radio->sync_word >> 8), (uint8_t) radio->sync_word };
-    uint8_t  pa[] = { 0x95, 4, 7, 0, 1 }, ocp[] = { radio->power > 22 ? 0x38 : 0x18 };
-    uint8_t  regulator[] = { 0x96, radio->power > 22 ? 1 : 0x11 };
-    uint8_t  tx_params[] = { 0x8e, (uint8_t) (radio->power - 17), 4 };
+    uint8_t  pa[] = { 0x95, 4, 7, 0, 1 }, ocp[] = { 0x38 };
+    // LDO is the SX1262's low-dropout linear regulator; DC-DC is its more efficient switching regulator,
+    // used together with the internal LDOs. LDO-only mode nearly doubles the SX1262 RX/TX supply current,
+    // while DC-DC+LDO reduces chip-side consumption. On the E22-900M30S this setting controls only the
+    // SX1262 core, not the module's external PA/LNA, so it affects efficiency and current draw but does not
+    // select the external PA or set its RF output power.
+    uint8_t  regulator[] = { 0x96, 0x01 };
+    uint8_t  tx_params[] = { 0x8e, (uint8_t) radio->power, 4 };
 
     if (gpiod_line_set_value(radio->rst.line, 0) < 0)
         return false;
@@ -639,10 +653,18 @@ static bool initialize_radio_locked(sx126x_t *radio) {
 
     reset_rx_progress(radio);
 
-    if (!command(radio, standby, sizeof(standby)) || !command(radio, packet_type, sizeof(packet_type)) || !command(radio, base, sizeof(base)) ||
-        !command(radio, tcxo, sizeof(tcxo)) || !command(radio, frequency, sizeof(frequency)) || !command(radio, modulation, sizeof(modulation)) ||
-        !write_register(radio, REG_SYNC_WORD, sync, sizeof(sync)) || !command(radio, pa, sizeof(pa)) || !write_register(radio, REG_OCP, ocp, sizeof(ocp)) ||
-        !command(radio, regulator, sizeof(regulator)) || !command(radio, tx_params, sizeof(tx_params)) || !enter_rx(radio))
+    if (!command(radio, standby, sizeof(standby)) ||
+        !command(radio, packet_type, sizeof(packet_type)) ||
+        !command(radio, base, sizeof(base)) ||
+        !command(radio, tcxo, sizeof(tcxo)) ||
+        !command(radio, frequency, sizeof(frequency)) ||
+        !command(radio, modulation, sizeof(modulation)) ||
+        !write_register(radio, REG_SYNC_WORD, sync, sizeof(sync)) ||
+        !command(radio, pa, sizeof(pa)) ||
+        !write_register(radio, REG_OCP, ocp, sizeof(ocp)) ||
+        !command(radio, regulator, sizeof(regulator)) ||
+        !command(radio, tx_params, sizeof(tx_params)) ||
+        !enter_rx(radio))
         return false;
 
     radio->last_dio_ms = monotonic_ms();

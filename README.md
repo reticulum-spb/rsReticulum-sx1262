@@ -51,14 +51,14 @@ RNode-linux).
 
 Optional fields and defaults:
 
-| Field | Default |
-| --- | ---: |
-| `rx_en`, `tx_en` | absent |
-| `preamble_symbols` | 25 |
-| `sync_word` | `0x1424` (write `5156` in YAML) |
-| `tcxo_voltage` | 1.8 V |
-| `irq_watchdog_seconds` | 60 |
-| `hard_reset_after` | 2 |
+| Field                  |                         Default |
+|------------------------|--------------------------------:|
+| `rx_en`, `tx_en`       |                          absent |
+| `preamble_symbols`     |                              25 |
+| `sync_word`            | `0x1424` (write `5156` in YAML) |
+| `tcxo_voltage`         |                           2.2 V |
+| `irq_watchdog_seconds` |                              60 |
+| `hard_reset_after`     |                               2 |
 
 Allowed TCXO voltages are 1.6, 1.7, 1.8, 2.2, 2.4, 2.7, 3.0 and 3.3 V.
 
