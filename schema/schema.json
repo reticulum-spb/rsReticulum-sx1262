@@ -4,85 +4,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "spi",
-    "cs",
-    "rst",
-    "busy",
-    "dio1",
+    "device",
     "frequency",
     "bandwidth",
     "spreading_factor",
     "coding_rate",
     "tx_power"
   ],
-  "$defs": {
-    "gpio": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["port", "pin"],
-      "properties": {
-        "port": {
-          "type": "integer",
-          "title": "GPIO chip",
-          "minimum": 0,
-          "maximum": 255,
-          "x-order": 10
-        },
-        "pin": {
-          "type": "integer",
-          "title": "GPIO line",
-          "minimum": 0,
-          "maximum": 255,
-          "x-order": 20
-        }
-      }
-    }
-  },
   "properties": {
-    "spi": {
-      "type": "string",
-      "title": "SPI device",
-      "minLength": 1,
-      "default": "/dev/spidev1.0",
-      "x-ui-group": "Hardware",
-      "x-order": 10
-    },
-    "cs": {
-      "$ref": "#/$defs/gpio",
-      "title": "Chip select",
-      "x-ui-group": "Hardware",
-      "x-order": 20
-    },
-    "rst": {
-      "$ref": "#/$defs/gpio",
-      "title": "Reset",
-      "x-ui-group": "Hardware",
-      "x-order": 30
-    },
-    "busy": {
-      "$ref": "#/$defs/gpio",
-      "title": "Busy",
-      "x-ui-group": "Hardware",
-      "x-order": 40
-    },
-    "dio1": {
-      "$ref": "#/$defs/gpio",
-      "title": "DIO1",
-      "x-ui-group": "Hardware",
-      "x-order": 50
-    },
-    "rx_en": {
-      "$ref": "#/$defs/gpio",
-      "title": "RX enable",
-      "x-ui-group": "Hardware",
-      "x-order": 60
-    },
-    "tx_en": {
-      "$ref": "#/$defs/gpio",
-      "title": "TX enable",
-      "x-ui-group": "Hardware",
-      "x-order": 70
-    },
     "frequency": {
       "type": "integer",
       "title": "Frequency",
@@ -95,7 +24,18 @@
     "bandwidth": {
       "type": "integer",
       "title": "Bandwidth",
-      "enum": [7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000],
+      "enum": [
+        7800,
+        10400,
+        15600,
+        20800,
+        31250,
+        41700,
+        62500,
+        125000,
+        250000,
+        500000
+      ],
       "default": 125000,
       "x-unit": "Hz",
       "x-ui-group": "Radio",
@@ -113,7 +53,12 @@
     "coding_rate": {
       "type": "integer",
       "title": "Coding rate denominator",
-      "enum": [4, 5, 6, 7, 8],
+      "enum": [
+        5,
+        6,
+        7,
+        8
+      ],
       "default": 5,
       "x-ui-group": "Radio",
       "x-order": 40
@@ -121,21 +66,21 @@
     "tx_power": {
       "type": "integer",
       "title": "TX power",
-      "minimum": 8,
+      "minimum": -9,
       "maximum": 30,
       "default": 22,
       "x-unit": "dBm",
       "x-ui-group": "Radio",
       "x-order": 50
     },
-    "preamble_symbols": {
+    "tx_preamble_symbols": {
       "type": "integer",
-      "title": "Preamble symbols",
-      "minimum": 1,
+      "title": "TX preamble symbols",
+      "minimum": 4,
       "maximum": 65535,
       "default": 25,
       "x-ui-group": "Protocol",
-      "x-order": 10
+      "x-order": 11
     },
     "sync_word": {
       "type": "integer",
@@ -145,15 +90,6 @@
       "default": 5156,
       "x-ui-group": "Protocol",
       "x-order": 20
-    },
-    "tcxo_voltage": {
-      "type": "number",
-      "title": "TCXO voltage",
-      "enum": [1.6, 1.7, 1.8, 2.2, 2.4, 2.7, 3.0, 3.3],
-      "default": 1.8,
-      "x-unit": "V",
-      "x-ui-group": "Protocol",
-      "x-order": 30
     },
     "irq_watchdog_seconds": {
       "type": "integer",
@@ -174,6 +110,57 @@
       "description": "Consecutive watchdog recoveries before toggling RST",
       "x-ui-group": "Recovery",
       "x-order": 20
+    },
+    "device": {
+      "type": "string",
+      "minLength": 1,
+      "default": "/dev/lora0",
+      "title": "Linux LoRa device",
+      "x-ui-group": "Hardware"
+    },
+    "tx_timeout_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400,
+      "default": 120,
+      "title": "TX completion timeout",
+      "x-unit": "s"
+    },
+    "rx_preamble_symbols": {
+      "type": "integer",
+      "title": "RX preamble symbols",
+      "minimum": 4,
+      "maximum": 65535,
+      "default": 65,
+      "x-ui-group": "Protocol",
+      "x-order": 10
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "spreading_factor": {
+            "enum": [
+              5,
+              6
+            ]
+          }
+        },
+        "required": [
+          "spreading_factor"
+        ]
+      },
+      "then": {
+        "properties": {
+          "tx_preamble_symbols": {
+            "minimum": 12
+          },
+          "rx_preamble_symbols": {
+            "minimum": 12
+          }
+        }
+      }
+    }
+  ]
 }

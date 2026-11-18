@@ -14,8 +14,7 @@ typedef void (*sx126x_online_fn)(void *, bool);
 
 sx126x_t *sx126x_open(const plugin_config_t *, sx126x_rx_fn, sx126x_log_fn, sx126x_online_fn, void *);
 bool      sx126x_start(sx126x_t *);
-bool      sx126x_send(sx126x_t *, const uint8_t *, size_t, uint32_t);
-uint32_t  sx126x_airtime_ms(const sx126x_t *, size_t);
+bool      sx126x_send(sx126x_t *, const uint8_t *, size_t, uint8_t);
 uint64_t  sx126x_bitrate(const sx126x_t *);
 void      sx126x_close(sx126x_t *);
 

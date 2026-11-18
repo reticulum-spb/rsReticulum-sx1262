@@ -55,22 +55,6 @@ static void radio_receive(void *opaque, const uint8_t *frame, size_t frame_len, 
         plugin->host->rx_packet(plugin->host->host_context, packet, packet_len, &metadata, sizeof(metadata));
 }
 
-typedef struct {
-    rns_plugin_t *plugin;
-    bool          success;
-} tx_context_t;
-
-static void transmit_frame(void *opaque, const uint8_t *frame, size_t frame_len) {
-    tx_context_t *tx = opaque;
-    uint32_t      timeout;
-
-    if (!tx->success)
-        return;
-
-    timeout = sx126x_airtime_ms(tx->plugin->radio, frame_len) * 2 + 500;
-    tx->success = sx126x_send(tx->plugin->radio, frame, frame_len, timeout);
-}
-
 static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8_t *yaml, size_t yaml_len, rns_plugin_t **out) {
     plugin_config_t *config = NULL;
     rns_plugin_t    *plugin = NULL;
@@ -108,14 +92,7 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
     config_free(config);
 
     if (!plugin->radio) {
-        host_log(host, RNS_LOG_ERROR, "sx1262: cannot open SPI or GPIO resources");
-        free(plugin);
-        return RNS_PLUGIN_ERROR;
-    }
-
-    if (!sx126x_start(plugin->radio)) {
-        host_log(host, RNS_LOG_ERROR, "sx1262: radio initialization failed");
-        sx126x_close(plugin->radio);
+        host_log(host, RNS_LOG_ERROR, "sx1262: cannot open or configure Linux LoRa device");
         free(plugin);
         return RNS_PLUGIN_ERROR;
     }
@@ -123,6 +100,15 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
     host->set_bitrate(host->host_context, sx126x_bitrate(plugin->radio));
     host->set_online(host->host_context, 1);
     atomic_store_explicit(&plugin->committed, true, memory_order_release);
+    if (!sx126x_start(plugin->radio)) {
+        atomic_store_explicit(&plugin->committed, false, memory_order_release);
+        host->set_online(host->host_context, 0);
+        host_log(host, RNS_LOG_ERROR, "sx1262: event worker initialization failed");
+        sx126x_close(plugin->radio);
+        free(plugin);
+        return RNS_PLUGIN_ERROR;
+    }
+
     *out = plugin;
     host_log(host, RNS_LOG_INFO, "sx1262: instance created and radio online");
 
@@ -130,7 +116,6 @@ static rns_plugin_result_t plugin_create(const rns_host_api_t *host, const uint8
 }
 
 static rns_plugin_result_t plugin_send(rns_plugin_t *plugin, const uint8_t *data, size_t len) {
-    tx_context_t tx = { .plugin = plugin, .success = true };
     uint8_t      sequence;
 
     if (!plugin || !data || len == 0 || len > RNS_PROTOCOL_MTU)
@@ -138,7 +123,7 @@ static rns_plugin_result_t plugin_send(rns_plugin_t *plugin, const uint8_t *data
 
     sequence = (uint8_t) (rand_r(&plugin->random_state) & 0xf0);
 
-    if (rns_fragment(data, len, sequence, transmit_frame, &tx) == 0 || !tx.success) {
+    if (!sx126x_send(plugin->radio, data, len, sequence)) {
         host_log(plugin->host, RNS_LOG_ERROR, "sx1262: physical transmission failed or timed out");
         return RNS_PLUGIN_ERROR;
     }
@@ -159,8 +144,8 @@ static void plugin_destroy(rns_plugin_t *plugin) {
 
 static const rns_plugin_info_t INFO = {
     .name = RNS_STRING_LITERAL("SX1262 RNode"),
-    .version = RNS_STRING_LITERAL("0.1.0"),
-    .description = RNS_STRING_LITERAL("Direct SPI SX1262 interface with RNode-compatible LoRa framing."),
+    .version = RNS_STRING_LITERAL("0.3.0"),
+    .description = RNS_STRING_LITERAL("Linux SX1262 interface with RNode-compatible LoRa framing."),
     .config_schema_json = { (const uint8_t *) RNS_PLUGIN_CONFIG_SCHEMA, sizeof(RNS_PLUGIN_CONFIG_SCHEMA) - 1 }
 };
 

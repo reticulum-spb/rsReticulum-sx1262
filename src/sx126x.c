@@ -1,12 +1,15 @@
+/* Linux sx1262 ABI client. Hardware recovery belongs to the kernel driver. */
+#define _GNU_SOURCE
 #include "sx126x.h"
+#include "sx1262_uapi.h"
+#include "protocol.h"
+#include "rns_plugin.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <gpiod.h>
-#include <linux/spi/spidev.h>
+#include <inttypes.h>
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
-#include <stdarg.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,760 +17,224 @@
 #include <time.h>
 #include <unistd.h>
 
-#define IRQ_TX_DONE      UINT16_C(0x0001)
-#define IRQ_RX_DONE      UINT16_C(0x0002)
-#define IRQ_PREAMBLE     UINT16_C(0x0004)
-#define IRQ_HEADER_VALID UINT16_C(0x0010)
-#define IRQ_HEADER_ERR   UINT16_C(0x0020)
-#define IRQ_CRC_ERR      UINT16_C(0x0040)
-#define IRQ_TIMEOUT      UINT16_C(0x0200)
-#define IRQ_MASK         (IRQ_TX_DONE | IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_HEADER_VALID | IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT)
-#define REG_SYNC_WORD    UINT16_C(0x0740)
-#define REG_OCP          UINT16_C(0x08e7)
-
-enum radio_state {
-    RADIO_IDLE,
-    RADIO_RX,
-    RADIO_TX
-};
-
-enum rx_progress {
-    RX_WAITING,
-    RX_PREAMBLE,
-    RX_HEADER
-};
-
-struct gpio_handle {
-    struct gpiod_chip *chip;
-    struct gpiod_line *line;
-};
-
 struct sx126x {
-    int                spi_fd;
-    struct gpio_handle cs, rst, busy, dio1, rx_en, tx_en;
-    pthread_t          irq_thread;
-    pthread_mutex_t    mutex;
-    pthread_cond_t     condition;
-    bool               mutex_ready, condition_ready, thread_started, tx_done, tx_failed;
-    atomic_bool        stopping;
-    bool               medium_busy;
-    enum radio_state   state;
-    enum rx_progress   rx_progress;
-    uint32_t           frequency, bandwidth, preamble;
-    uint16_t           sync_word;
-    uint8_t            sf, cr, power, bw_code, tcxo_code;
-    uint64_t           bitrate;
-    unsigned int       random_state;
-    uint32_t           irq_watchdog_ms, preamble_timeout_ms, frame_timeout_ms;
-    uint8_t            hard_reset_after, watchdog_strikes;
-    uint64_t           last_dio_ms, rx_deadline_ms;
-    bool               service_online;
-    sx126x_rx_fn       receive;
-    sx126x_log_fn      log;
-    sx126x_online_fn   online;
-    void              *context;
+    int fd, wake[2];
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    bool started, stopping, failed, pending, expired, success;
+    uint64_t cookie, bitrate;
+    uint32_t expected, timeout_seconds;
+    sx126x_rx_fn receive;
+    sx126x_log_fn log;
+    sx126x_online_fn online;
+    void *context;
 };
 
-static uint64_t monotonic_ms(void) {
-    struct timespec value;
-
-    clock_gettime(CLOCK_MONOTONIC, &value);
-    return (uint64_t) value.tv_sec * UINT64_C(1000) + (uint64_t) value.tv_nsec / UINT64_C(1000000);
+static void log_error(sx126x_t *r, const char *operation) {
+    char message[256];
+    snprintf(message, sizeof(message), "sx1262: %s: %s", operation, strerror(errno));
+    if (r->log) r->log(r->context, RNS_LOG_ERROR, message);
 }
 
-static void log_message(sx126x_t *radio, int level, const char *format, ...) {
-    char    message[256];
-    va_list args;
-
-    if (!radio->log)
-        return;
-
-    va_start(args, format);
-    vsnprintf(message, sizeof(message), format, args);
-    va_end(args);
-
-    radio->log(radio->context, level, message);
-}
-
-static struct timespec deadline_ms(uint32_t milliseconds) {
-    struct timespec value;
-
-    clock_gettime(CLOCK_REALTIME, &value);
-    value.tv_sec += milliseconds / 1000;
-    value.tv_nsec += (long) (milliseconds % 1000) * 1000000L;
-
-    if (value.tv_nsec >= 1000000000L) {
-        value.tv_sec++;
-        value.tv_nsec -= 1000000000L;
-    }
-
-    return value;
-}
-
-static void sleep_us(long microseconds) {
-    struct timespec delay = {
-        .tv_sec = microseconds / 1000000L,
-        .tv_nsec = (microseconds % 1000000L) * 1000L
-    };
-
-    while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {
-    }
-}
-
-static bool gpio_open(struct gpio_handle *handle, const gpio_config_t *config, const char *consumer, bool output, bool events) {
-    if (!config)
-        return true;
-
-    handle->chip = gpiod_chip_open_by_number(config->port);
-
-    if (!handle->chip)
-        return false;
-
-    handle->line = gpiod_chip_get_line(handle->chip, config->pin);
-
-    if (!handle->line)
-        return false;
-
-    if (events)
-        return gpiod_line_request_both_edges_events(handle->line, consumer) == 0;
-
-    if (output)
-        return gpiod_line_request_output(handle->line, consumer, 0) == 0;
-
-    return gpiod_line_request_input(handle->line, consumer) == 0;
-}
-
-static void gpio_close(struct gpio_handle *handle) {
-    if (handle->line)
-        gpiod_line_release(handle->line);
-
-    if (handle->chip)
-        gpiod_chip_close(handle->chip);
-
-    handle->line = NULL;
-    handle->chip = NULL;
-}
-
-static bool spi_transfer(sx126x_t *radio, struct spi_ioc_transfer *transfers, size_t count, size_t expected) {
-    int result;
-
-    if (gpiod_line_set_value(radio->cs.line, 0) < 0)
-        return false;
-
-    result = ioctl(radio->spi_fd, SPI_IOC_MESSAGE(count), transfers);
-
-    if (gpiod_line_set_value(radio->cs.line, 1) < 0)
-        return false;
-
-    return result == (int) expected;
-}
-
-static bool write_bytes(sx126x_t *radio, const uint8_t *data, size_t len) {
-    struct spi_ioc_transfer transfer = {
-        .tx_buf = (uintptr_t) data,
-        .len = (uint32_t) len,
-        .speed_hz = 1000000,
-        .bits_per_word = 8
-    };
-
-    return spi_transfer(radio, &transfer, 1, len);
-}
-
-static bool wait_busy(sx126x_t *radio, uint32_t timeout_ms);
-
-static bool command_read(sx126x_t *radio, const uint8_t *command, size_t command_len, uint8_t *result, size_t result_len) {
-    struct spi_ioc_transfer transfers[2] = {
-        { .tx_buf = (uintptr_t) command, .len = (uint32_t) command_len, .speed_hz = 1000000, .bits_per_word = 8 },
-        { .rx_buf = (uintptr_t) result,  .len = (uint32_t) result_len,  .speed_hz = 1000000, .bits_per_word = 8 }
-    };
-
-    return wait_busy(radio, 150) && spi_transfer(radio, transfers, 2, command_len + result_len);
-}
-
-static bool wait_busy(sx126x_t *radio, uint32_t timeout_ms) {
-    for (uint32_t elapsed = 0; elapsed < timeout_ms; ++elapsed) {
-        int value = gpiod_line_get_value(radio->busy.line);
-
-        if (value == 0)
-            return true;
-
-        if (value < 0)
-            return false;
-
-        sleep_us(1000);
-    }
-
-    log_message(radio, 1, "SX126x BUSY timeout");
-    return false;
-}
-
-static bool command(sx126x_t *radio, const uint8_t *data, size_t len) {
-    return wait_busy(radio, 150) && write_bytes(radio, data, len);
-}
-
-static bool write_register(sx126x_t *radio, uint16_t address, const uint8_t *data, size_t len) {
-    uint8_t buffer[32];
-
-    if (len + 3 > sizeof(buffer))
-        return false;
-
-    buffer[0] = 0x0d;
-    buffer[1] = (uint8_t) (address >> 8);
-    buffer[2] = (uint8_t) address;
-    memcpy(buffer + 3, data, len);
-
-    return command(radio, buffer, len + 3);
-}
-
-static bool set_antenna(sx126x_t *radio, enum radio_state state) {
-    if (radio->rx_en.line && gpiod_line_set_value(radio->rx_en.line, 0) < 0)
-        return false;
-
-    if (radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 0) < 0)
-        return false;
-
-    sleep_us(100);
-
-    if (state == RADIO_RX && radio->rx_en.line && gpiod_line_set_value(radio->rx_en.line, 1) < 0)
-        return false;
-
-    if (state == RADIO_TX && radio->tx_en.line && gpiod_line_set_value(radio->tx_en.line, 1) < 0)
-        return false;
-
-    radio->state = state;
-
-    return true;
-}
-
-static bool packet_params(sx126x_t *radio, uint8_t payload) {
-    uint8_t data[] = { 0x8c, (uint8_t) (radio->preamble >> 8), (uint8_t) radio->preamble, 0, payload, 1, 0, 0, 0, 0 };
-
-    return command(radio, data, sizeof(data));
-}
-
-static bool configure_irq(sx126x_t *radio) {
-    uint8_t clear[] = { 0x02, 0x03, 0xff };
-    uint8_t setup[] = { 0x08, (uint8_t) (IRQ_MASK >> 8), (uint8_t) IRQ_MASK, (uint8_t) (IRQ_MASK >> 8), (uint8_t) IRQ_MASK, 0, 0, 0, 0 };
-
-    return command(radio, clear, sizeof(clear)) && command(radio, setup, sizeof(setup));
-}
-
-static bool enter_rx(sx126x_t *radio) {
-    uint8_t receive[] = { 0x82, 0xff, 0xff, 0xff };
-
-    return packet_params(radio, 255) && configure_irq(radio) && set_antenna(radio, RADIO_RX) && command(radio, receive, sizeof(receive));
-}
-
-static bool read_irq_status(sx126x_t *radio, uint16_t *status) {
-    uint8_t command_data[] = { 0x12 };
-    uint8_t response[3] = { 0 };
-
-    if (!command_read(radio, command_data, sizeof(command_data), response, sizeof(response)))
-        return false;
-
-    *status = (uint16_t) ((uint16_t) response[1] << 8) | response[2];
-    return true;
-}
-
-static void clear_irq(sx126x_t *radio, uint16_t status) {
-    uint8_t data[] = { 0x02, (uint8_t) (status >> 8), (uint8_t) status };
-
-    (void) command(radio, data, sizeof(data));
-}
-
-static bool receive_packet(sx126x_t *radio) {
-    uint8_t status_command[] = { 0x13 }, status[3] = { 0 }, read_command[2], response[256];
-    uint8_t packet_command[] = { 0x14 }, packet_status[4] = { 0 };
-
-    if (!command_read(radio, status_command, sizeof(status_command), status, sizeof(status)))
-        return false;
-
-    if (status[1] < 2)
-        return true;
-
-    read_command[0] = 0x1e;
-    read_command[1] = status[2];
-
-    if (!command_read(radio, read_command, sizeof(read_command), response, (size_t) status[1] + 1))
-        return false;
-
-    if (!command_read(radio, packet_command, sizeof(packet_command), packet_status, sizeof(packet_status)))
-        return false;
-
-    if (radio->receive)
-        radio->receive(radio->context, response + 1, status[1], (int16_t) (-(int) packet_status[1] / 2), (int16_t) lround((double) (int8_t) packet_status[2] / 4.0));
-
-    return true;
-}
-
-static bool initialize_radio_locked(sx126x_t *radio);
-
-static void set_service_online(sx126x_t *radio, bool online) {
-    if (radio->service_online == online)
-        return;
-
-    radio->service_online = online;
-
-    if (radio->online)
-        radio->online(radio->context, online);
-}
-
-static void reset_rx_progress(sx126x_t *radio) {
-    radio->medium_busy = false;
-    radio->rx_progress = RX_WAITING;
-    radio->rx_deadline_ms = 0;
-    pthread_cond_broadcast(&radio->condition);
-}
-
-static bool soft_recover_locked(sx126x_t *radio, const char *reason) {
-    uint8_t standby[] = { 0x80, 0 };
-
-    log_message(radio, 2, "sx1262: %s, restarting continuous RX", reason);
-    reset_rx_progress(radio);
-
-    if (!command(radio, standby, sizeof(standby)) || !enter_rx(radio)) {
-        log_message(radio, 1, "sx1262: soft RX recovery failed");
-        return false;
-    }
-
-    radio->last_dio_ms = monotonic_ms();
-    return true;
-}
-
-static bool hard_recover_locked(sx126x_t *radio, const char *reason) {
-    log_message(radio, 2, "sx1262: %s, performing hardware reset", reason);
-    set_service_online(radio, false);
-    reset_rx_progress(radio);
-    radio->tx_failed = radio->state == RADIO_TX;
-    pthread_cond_broadcast(&radio->condition);
-    radio->last_dio_ms = monotonic_ms();
-
-    if (!initialize_radio_locked(radio)) {
-        radio->state = RADIO_IDLE;
-        log_message(radio, 1, "sx1262: hardware reset and reinitialization failed");
-        return false;
-    }
-
-    radio->watchdog_strikes = 0;
-    radio->last_dio_ms = monotonic_ms();
-    set_service_online(radio, true);
-    log_message(radio, 3, "sx1262: radio recovered and online");
-    return true;
-}
-
-static bool recover_locked(sx126x_t *radio, const char *reason) {
-    radio->watchdog_strikes++;
-
-    if (radio->watchdog_strikes >= radio->hard_reset_after)
-        return hard_recover_locked(radio, reason);
-
-    if (soft_recover_locked(radio, reason))
-        return true;
-
-    return hard_recover_locked(radio, reason);
-}
-
-static void handle_irq_status_locked(sx126x_t *radio, uint16_t status) {
-    uint64_t now = monotonic_ms();
-    bool     terminal = (status & (IRQ_HEADER_ERR | IRQ_RX_DONE | IRQ_CRC_ERR | IRQ_TIMEOUT)) != 0;
-
-    if (status & IRQ_PREAMBLE) {
-        radio->medium_busy = true;
-        radio->rx_progress = RX_PREAMBLE;
-        radio->rx_deadline_ms = now + radio->preamble_timeout_ms;
-        pthread_cond_broadcast(&radio->condition);
-    }
-
-    if (status & IRQ_HEADER_VALID) {
-        radio->medium_busy = true;
-        radio->rx_progress = RX_HEADER;
-        radio->rx_deadline_ms = now + radio->frame_timeout_ms;
-        pthread_cond_broadcast(&radio->condition);
-    }
-
-    if ((status & IRQ_RX_DONE) && !(status & IRQ_CRC_ERR) && !receive_packet(radio)) {
-        (void) hard_recover_locked(radio, "SPI failure while reading received packet");
-        return;
-    }
-
-    if (status & IRQ_TX_DONE) {
-        radio->tx_done = true;
-        pthread_cond_broadcast(&radio->condition);
-    }
-
-    if (status & (IRQ_TIMEOUT | IRQ_HEADER_ERR)) {
-        radio->tx_failed = radio->state == RADIO_TX;
-        pthread_cond_broadcast(&radio->condition);
-    }
-
-    clear_irq(radio, status);
-
-    if (terminal) {
-        reset_rx_progress(radio);
-
-        if (radio->state != RADIO_TX && !enter_rx(radio))
-            (void) hard_recover_locked(radio, "cannot return to RX after IRQ");
-    }
-}
-
-static void watchdog_locked(sx126x_t *radio) {
-    uint64_t now = monotonic_ms();
-    uint16_t status;
-
-    if (radio->state == RADIO_TX)
-        return;
-
-    if (radio->rx_deadline_ms != 0 && now >= radio->rx_deadline_ms) {
-        if (!read_irq_status(radio, &status)) {
-            (void) hard_recover_locked(radio, "SPI failure while polling RX deadline");
-            return;
+static void handle_event(sx126x_t *r, const struct sx1262_event *e) {
+    if (e->type == SX1262_EVENT_RX) {
+        if (e->length >= 2 && e->length <= SX1262_MAX_PAYLOAD && r->receive)
+            r->receive(r->context, e->data, e->length,
+                       (int16_t)(e->rssi_half_dbm / 2),
+                       (int16_t)lround(e->snr_quarter_db / 4.0));
+    } else if (e->type == SX1262_EVENT_TX) {
+        char message[192];
+        bool late = false, matched;
+        pthread_mutex_lock(&r->mutex);
+        matched = r->pending && e->cookie == r->cookie;
+        if (matched) {
+            late = r->expired;
+            r->success = e->status == 0 && e->frames_sent == r->expected;
+            r->pending = false;
+            pthread_cond_broadcast(&r->condition);
         }
-
-        if (status != 0) {
-            log_message(radio, 2, "sx1262: polled pending IRQ 0x%04x after RX deadline", status);
-            handle_irq_status_locked(radio, status);
-        }
-
-        if (radio->rx_progress != RX_WAITING)
-            (void) recover_locked(radio, radio->rx_progress == RX_HEADER ? "RX frame timeout after HEADER_VALID" : "RX header timeout after PREAMBLE_DETECTED");
-
-        return;
-    }
-
-    if (radio->irq_watchdog_ms == 0 || now - radio->last_dio_ms < radio->irq_watchdog_ms)
-        return;
-
-    if (!read_irq_status(radio, &status)) {
-        (void) hard_recover_locked(radio, "SPI failure while polling DIO1 watchdog");
-        return;
-    }
-    radio->last_dio_ms = now;
-
-    if (status != 0) {
-        log_message(radio, 2, "sx1262: pending IRQ 0x%04x found without DIO1 event", status);
-        handle_irq_status_locked(radio, status);
-        radio->watchdog_strikes++;
-
-        if (radio->watchdog_strikes >= radio->hard_reset_after)
-            (void) hard_recover_locked(radio, "repeated lost DIO1 events");
-
-        return;
-    }
-
-    (void) recover_locked(radio, "DIO1 watchdog expired");
-}
-
-static void *irq_worker(void *opaque) {
-    sx126x_t *radio = opaque;
-
-    while (!atomic_load_explicit(&radio->stopping, memory_order_acquire)) {
-        struct timespec timeout = { .tv_sec = 0, .tv_nsec = 100000000L };
-        int             ready = gpiod_line_event_wait(radio->dio1.line, &timeout);
-
-        if (ready < 0) {
-            log_message(radio, 1, "sx1262: DIO1 event wait failed");
-            continue;
-        }
-
-        if (ready == 0) {
-            pthread_mutex_lock(&radio->mutex);
-            watchdog_locked(radio);
-            pthread_mutex_unlock(&radio->mutex);
-            continue;
-        }
-
-        struct gpiod_line_event event;
-
-        if (gpiod_line_event_read(radio->dio1.line, &event) < 0 || event.event_type != GPIOD_LINE_EVENT_RISING_EDGE)
-            continue;
-
-        pthread_mutex_lock(&radio->mutex);
-
-        if (!atomic_load_explicit(&radio->stopping, memory_order_acquire)) {
-            uint16_t status;
-            radio->last_dio_ms = monotonic_ms();
-            radio->watchdog_strikes = 0;
-
-            if (read_irq_status(radio, &status))
-                handle_irq_status_locked(radio, status);
-            else
-                (void) hard_recover_locked(radio, "SPI failure while reading DIO1 IRQ");
-        }
-        pthread_mutex_unlock(&radio->mutex);
-    }
-
-    return NULL;
-}
-static bool map_bandwidth(uint32_t bandwidth, uint8_t *code) {
-    static const struct {
-        uint32_t hz;
-        uint8_t  code;
-    } map[] = {
-        { 7800,   0  },
-        { 10400,  8  },
-        { 15600,  1  },
-        { 20800,  9  },
-        { 31250,  2  },
-        { 41700,  10 },
-        { 62500,  3  },
-        { 125000, 4  },
-        { 250000, 5  },
-        { 500000, 6  }
-    };
-
-    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
-        if (map[i].hz == bandwidth) {
-            *code = map[i].code;
-            return true;
+        pthread_mutex_unlock(&r->mutex);
+        if (r->log && (late || !matched || e->status)) {
+            snprintf(message, sizeof(message),
+                     "sx1262: %sTX result cookie=%" PRIu64 " status=%d frames_sent=%u",
+                     !matched ? "unmatched " : late ? "late " : "",
+                     (uint64_t)e->cookie, e->status, e->frames_sent);
+            r->log(r->context, RNS_LOG_WARN, message);
         }
     }
-
-    return false;
 }
 
-static bool map_tcxo(double voltage, uint8_t *code) {
-    static const struct {
-        double  voltage;
-        uint8_t code;
-    } map[] = {
-        { 1.6, 0 },
-        { 1.7, 1 },
-        { 1.8, 2 },
-        { 2.2, 3 },
-        { 2.4, 4 },
-        { 2.7, 5 },
-        { 3.0, 6 },
-        { 3.3, 7 }
-    };
-
-    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
-        if (fabs(map[i].voltage - voltage) < 0.01) {
-            *code = map[i].code;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-sx126x_t *sx126x_open(const plugin_config_t *config, sx126x_rx_fn receive, sx126x_log_fn log, sx126x_online_fn online, void *context) {
-    sx126x_t *radio = calloc(1, sizeof(*radio));
-
-    if (!radio)
-        return NULL;
-
-    atomic_init(&radio->stopping, false);
-    radio->random_state = (unsigned int) (uintptr_t) radio ^ (unsigned int) time(NULL);
-    radio->spi_fd = -1;
-    radio->frequency = config->frequency;
-    radio->bandwidth = config->bandwidth;
-    radio->preamble = config->preamble_symbols;
-    radio->sync_word = config->sync_word;
-    radio->sf = config->spreading_factor;
-    radio->cr = config->coding_rate;
-    radio->power = config->tx_power;
-    radio->irq_watchdog_ms = config->irq_watchdog_seconds * UINT32_C(1000);
-    radio->hard_reset_after = config->hard_reset_after;
-    radio->receive = receive;
-    radio->log = log;
-    radio->online = online;
-    radio->context = context;
-
-    if (!map_bandwidth(config->bandwidth, &radio->bw_code) || !map_tcxo(config->tcxo_voltage, &radio->tcxo_code))
-        goto fail;
-
-    radio->bitrate = (uint64_t) ((double) radio->sf * (4.0 / radio->cr) / ((double) (UINT32_C(1) << radio->sf) / ((double) radio->bandwidth / 1000.0)) * 1000.0);
-    double   symbol_ms = pow(2.0, radio->sf) / radio->bandwidth * 1000.0;
-    uint32_t preamble_ms = (uint32_t) ceil((radio->preamble + 4.25) * symbol_ms);
-    uint32_t total_ms = sx126x_airtime_ms(radio, 255);
-    uint32_t payload_ms = total_ms > preamble_ms ? total_ms - preamble_ms : total_ms;
-    radio->preamble_timeout_ms = preamble_ms * 3 / 2 + 25;
-    radio->frame_timeout_ms = payload_ms * 3 / 2 + 25;
-
-    if (radio->preamble_timeout_ms < 100)
-        radio->preamble_timeout_ms = 100;
-
-    if (radio->frame_timeout_ms < 100)
-        radio->frame_timeout_ms = 100;
-
-    radio->spi_fd = open(config->spi, O_RDWR | O_CLOEXEC);
-
-    if (radio->spi_fd < 0)
-        goto fail;
-
-    if (!gpio_open(&radio->cs, &config->cs, "sx1262-cs", true, false) || !gpio_open(&radio->rst, &config->rst, "sx1262-rst", true, false) ||
-        !gpio_open(&radio->busy, &config->busy, "sx1262-busy", false, false) || !gpio_open(&radio->dio1, &config->dio1, "sx1262-dio1", false, true) ||
-        !gpio_open(&radio->rx_en, config->rx_en, "sx1262-rx-en", true, false) || !gpio_open(&radio->tx_en, config->tx_en, "sx1262-tx-en", true, false))
-        goto fail;
-
-    if (pthread_mutex_init(&radio->mutex, NULL) != 0)
-        goto fail;
-
-    radio->mutex_ready = true;
-
-    if (pthread_cond_init(&radio->condition, NULL) != 0)
-        goto fail;
-
-    radio->condition_ready = true;
-
-    return radio;
-fail:
-    sx126x_close(radio);
-    return NULL;
-}
-
-static bool initialize_radio_locked(sx126x_t *radio) {
-    uint8_t  standby[] = { 0x80, 0 }, packet_type[] = { 0x8a, 1 }, base[] = { 0x8f, 0, 0 };
-    uint8_t  tcxo[] = { 0x97, radio->tcxo_code, 0, 5, 0x60 };
-    uint64_t frf = (uint64_t) radio->frequency * UINT64_C(33554432) / UINT64_C(32000000);
-    uint8_t  frequency[] = { 0x86, (uint8_t) (frf >> 24), (uint8_t) (frf >> 16), (uint8_t) (frf >> 8), (uint8_t) frf };
-    uint8_t  modulation[] = { 0x8b, radio->sf, radio->bw_code, (uint8_t) (radio->cr - 4), 0, 0, 0, 0, 0 };
-    uint8_t  sync[] = { (uint8_t) (radio->sync_word >> 8), (uint8_t) radio->sync_word };
-    uint8_t  pa[] = { 0x95, 4, 7, 0, 1 }, ocp[] = { radio->power > 22 ? 0x38 : 0x18 };
-    uint8_t  regulator[] = { 0x96, radio->power > 22 ? 1 : 0x11 };
-    uint8_t  tx_params[] = { 0x8e, (uint8_t) (radio->power - 17), 4 };
-
-    if (gpiod_line_set_value(radio->rst.line, 0) < 0)
-        return false;
-
-    sleep_us(10000);
-
-    if (gpiod_line_set_value(radio->rst.line, 1) < 0)
-        return false;
-
-    sleep_us(10000);
-
-    reset_rx_progress(radio);
-
-    if (!command(radio, standby, sizeof(standby)) || !command(radio, packet_type, sizeof(packet_type)) || !command(radio, base, sizeof(base)) ||
-        !command(radio, tcxo, sizeof(tcxo)) || !command(radio, frequency, sizeof(frequency)) || !command(radio, modulation, sizeof(modulation)) ||
-        !write_register(radio, REG_SYNC_WORD, sync, sizeof(sync)) || !command(radio, pa, sizeof(pa)) || !write_register(radio, REG_OCP, ocp, sizeof(ocp)) ||
-        !command(radio, regulator, sizeof(regulator)) || !command(radio, tx_params, sizeof(tx_params)) || !enter_rx(radio))
-        return false;
-
-    radio->last_dio_ms = monotonic_ms();
-    return true;
-}
-
-bool sx126x_start(sx126x_t *radio) {
-    if (!initialize_radio_locked(radio))
-        return false;
-
-    if (pthread_create(&radio->irq_thread, NULL, irq_worker, radio) != 0)
-        return false;
-
-    radio->thread_started = true;
-    radio->service_online = true;
-
-    return true;
-}
-
-bool sx126x_send(sx126x_t *radio, const uint8_t *data, size_t len, uint32_t timeout_ms) {
-    uint8_t buffer[257], transmit[] = { 0x83, 0, 0, 0 };
-    bool    success = false;
-    bool    attempted = false;
-
-    if (!radio || !data || len < 2 || len > 255)
-        return false;
-
-    pthread_mutex_lock(&radio->mutex);
-
-    struct timespec medium_deadline = deadline_ms(timeout_ms);
-
+static void *event_worker(void *opaque) {
+    sx126x_t *r = opaque;
+    bool reported = true, healthy = true;
     for (;;) {
-        while (radio->medium_busy && !atomic_load_explicit(&radio->stopping, memory_order_acquire))
-            if (pthread_cond_timedwait(&radio->condition, &radio->mutex, &medium_deadline) == ETIMEDOUT)
-                goto done;
-
-        if (atomic_load_explicit(&radio->stopping, memory_order_acquire))
-            goto done;
-
-        uint32_t contention_ms = (rand_r(&radio->random_state) % 15u) * 24u;
-
-        if (contention_ms == 0)
-            break;
-
-        struct timespec contention_deadline = deadline_ms(contention_ms);
-        int             wait_result = pthread_cond_timedwait(&radio->condition, &radio->mutex, &contention_deadline);
-
-        if (wait_result == ETIMEDOUT && !radio->medium_busy)
-            break;
+        /* Suppress the level-triggered POLLERR while offline. The wake pipe
+         * still stops us promptly; GET_STATS probes recovery every 100 ms. */
+        struct pollfd fds[2] = {
+            { .fd = healthy ? r->fd : -1, .events = POLLIN },
+            { .fd = r->wake[0], .events = POLLIN }
+        };
+        struct sx1262_stats stats;
+        bool stopping, failed, online;
+        int result = poll(fds, 2, 100);
+        pthread_mutex_lock(&r->mutex);
+        stopping = r->stopping;
+        pthread_mutex_unlock(&r->mutex);
+        if (stopping) break;
+        if (result < 0 && errno == EINTR) continue;
+        failed = result < 0 || (fds[0].revents & POLLNVAL);
+        /* Drain even offline, including completions already queued on remove.
+         * Bound each pass so RX traffic cannot starve shutdown/status checks. */
+        for (unsigned int i = 0; !failed && i < 160; ++i) {
+            struct sx1262_event event;
+            ssize_t size = read(r->fd, &event, sizeof(event));
+            if (size < 0 && errno == EINTR) continue;
+            if (size < 0 && errno == EAGAIN) break;
+            if (size != sizeof(event) || event.version != SX1262_ABI_VERSION) {
+                if (size >= 0) errno = EPROTO;
+                log_error(r, "read event");
+                failed = true;
+                break;
+            }
+            handle_event(r, &event);
+        }
+        if (!failed && ioctl(r->fd, SX1262_IOC_GET_STATS, &stats) < 0) {
+            if (errno == EINTR) continue;
+            log_error(r, "GET_STATS");
+            failed = true;
+        }
+        if (!failed && stats.version != SX1262_ABI_VERSION) failed = true;
+        healthy = !failed && stats.online;
+        pthread_mutex_lock(&r->mutex);
+        r->failed = failed;
+        online = healthy && !(r->pending && r->expired);
+        if (failed) pthread_cond_broadcast(&r->condition);
+        pthread_mutex_unlock(&r->mutex);
+        if (online != reported) {
+            if (r->online) r->online(r->context, online);
+            reported = online;
+        }
+        if (failed) break;
     }
+    return NULL;
+}
 
-    buffer[0] = 0x0e;
-    buffer[1] = 0;
-    memcpy(buffer + 2, data, len);
-    radio->tx_done = false;
-    radio->tx_failed = false;
-    attempted = true;
+sx126x_t *sx126x_open(const plugin_config_t *c, sx126x_rx_fn receive,
+                     sx126x_log_fn log, sx126x_online_fn online, void *context) {
+    sx126x_t *r = calloc(1, sizeof(*r));
+    struct sx1262_config config;
+    pthread_condattr_t attr;
+    if (!r) return NULL;
+    r->fd = r->wake[0] = r->wake[1] = -1;
+    r->receive = receive; r->log = log; r->online = online; r->context = context;
+    r->timeout_seconds = c->tx_timeout_seconds;
+    r->bitrate = (uint64_t)c->spreading_factor * 4 * c->bandwidth /
+                 ((UINT64_C(1) << c->spreading_factor) * c->coding_rate);
+    if (pthread_mutex_init(&r->mutex, NULL)) { free(r); return NULL; }
+    if (pthread_condattr_init(&attr)) goto mutex_fail;
+    int result = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (!result) result = pthread_cond_init(&r->condition, &attr);
+    pthread_condattr_destroy(&attr);
+    if (result) goto mutex_fail;
+    r->fd = open(c->device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (r->fd < 0) { log_error(r, "open device"); goto fail; }
+    if (ioctl(r->fd, SX1262_IOC_GET_CONFIG, &config) < 0) {
+        log_error(r, "GET_CONFIG"); goto fail;
+    }
+    if (config.version != SX1262_ABI_VERSION) {
+        errno = EPROTO; log_error(r, "driver ABI"); goto fail;
+    }
+    /* Do not inherit PHY settings from a previous opener. */
+    config = (struct sx1262_config) {
+        .version = SX1262_ABI_VERSION,
+        .frequency_hz = c->frequency, .bandwidth_hz = c->bandwidth,
+        .tx_power_dbm = c->tx_power, .tx_preamble_symbols = c->tx_preamble_symbols,
+        .rx_preamble_symbols = c->rx_preamble_symbols,
+        .silence_timeout_ms = c->irq_watchdog_seconds * 1000,
+        .sync_word = c->sync_word, .spreading_factor = c->spreading_factor,
+        .coding_rate = c->coding_rate, .crc = 1, .ldro = 1,
+        .hard_reset_after = c->hard_reset_after
+    };
+    if (ioctl(r->fd, SX1262_IOC_SET_CONFIG, &config) < 0) {
+        log_error(r, "SET_CONFIG"); goto fail;
+    }
+    if (pipe2(r->wake, O_CLOEXEC | O_NONBLOCK) < 0) {
+        log_error(r, "wake pipe"); goto fail;
+    }
+    return r;
+fail:
+    sx126x_close(r);
+    return NULL;
+mutex_fail:
+    pthread_mutex_destroy(&r->mutex);
+    free(r);
+    return NULL;
+}
 
-    if (!command(radio, buffer, len + 2) || !packet_params(radio, (uint8_t) len) || !configure_irq(radio) || !set_antenna(radio, RADIO_TX) || !command(radio, transmit, sizeof(transmit)))
-        goto done;
+bool sx126x_start(sx126x_t *r) {
+    if (pthread_create(&r->thread, NULL, event_worker, r)) return false;
+    r->started = true;
+    return true;
+}
 
-    struct timespec deadline = deadline_ms(timeout_ms);
+static void append_frame(void *context, const uint8_t *data, size_t len) {
+    struct sx1262_tx_batch *batch = context;
+    struct sx1262_frame *frame = &batch->frames[batch->count++];
+    frame->length = (uint16_t)len;
+    memcpy(frame->data, data, len);
+}
 
-    while (!radio->tx_done && !radio->tx_failed && !atomic_load_explicit(&radio->stopping, memory_order_acquire))
-        if (pthread_cond_timedwait(&radio->condition, &radio->mutex, &deadline) == ETIMEDOUT)
+bool sx126x_send(sx126x_t *r, const uint8_t *data, size_t len, uint8_t sequence) {
+    struct sx1262_tx_batch batch = { .version = SX1262_ABI_VERSION };
+    struct timespec deadline;
+    bool success = false;
+    if (!r || !rns_fragment(data, len, sequence, append_frame, &batch)) return false;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += r->timeout_seconds;
+    pthread_mutex_lock(&r->mutex);
+    if (r->pending || r->failed || r->stopping) goto out;
+    batch.cookie = ++r->cookie;
+    r->expected = batch.count;
+    r->success = r->expired = false;
+    /* Nonblocking submission: EAGAIN is a definite rejection, never retry an
+     * accepted batch. The lock prevents completion racing the pending flag. */
+    if (ioctl(r->fd, SX1262_IOC_TX_BATCH, &batch) < 0) {
+        log_error(r, "TX_BATCH"); goto out;
+    }
+    r->pending = true;
+    while (r->pending && !r->failed && !r->stopping) {
+        int result = pthread_cond_timedwait(&r->condition, &r->mutex, &deadline);
+        if (result && r->pending) {
+            r->expired = true;
+            if (r->log) r->log(r->context, RNS_LOG_WARN,
+                "sx1262: TX wait expired; batch remains pending, new TX blocked until completion");
             break;
-
-    success = radio->tx_done && !radio->tx_failed && !atomic_load_explicit(&radio->stopping, memory_order_acquire);
-
-    if (!enter_rx(radio))
-        success = false;
-done:
-    if (attempted && !success)
-        (void) hard_recover_locked(radio, "TX command or TX_DONE timeout");
-
-    pthread_mutex_unlock(&radio->mutex);
-
+        }
+    }
+    success = !r->pending && r->success && !r->failed && !r->stopping;
+out:
+    pthread_mutex_unlock(&r->mutex);
     return success;
 }
 
-uint32_t sx126x_airtime_ms(const sx126x_t *radio, size_t len) {
-    double symbol = pow(2.0, radio->sf) / radio->bandwidth * 1000.0;
-    double bits = 8.0 * len - 4.0 * radio->sf + 44.0;
-    double payload = ceil(bits / (4.0 * radio->sf)) * radio->cr + 8.0;
+uint64_t sx126x_bitrate(const sx126x_t *r) { return r ? r->bitrate : 0; }
 
-    return (uint32_t) ceil((radio->preamble + 4.25 + payload) * symbol);
-}
-
-uint64_t sx126x_bitrate(const sx126x_t *radio) {
-    return radio ? radio->bitrate : 0;
-}
-
-void sx126x_close(sx126x_t *radio) {
-    if (!radio)
-        return;
-
-    atomic_store_explicit(&radio->stopping, true, memory_order_release);
-
-    if (radio->condition_ready)
-        pthread_cond_broadcast(&radio->condition);
-
-    if (radio->thread_started)
-        pthread_join(radio->irq_thread, NULL);
-
-    if (radio->mutex_ready) {
-        pthread_mutex_lock(&radio->mutex);
-        (void) set_antenna(radio, RADIO_IDLE);
-        pthread_mutex_unlock(&radio->mutex);
+void sx126x_close(sx126x_t *r) {
+    if (!r) return;
+    pthread_mutex_lock(&r->mutex);
+    r->stopping = true;
+    pthread_cond_broadcast(&r->condition);
+    pthread_mutex_unlock(&r->mutex);
+    if (r->started) {
+        char byte = 0;
+        (void)write(r->wake[1], &byte, 1);
+        pthread_join(r->thread, NULL);
     }
-
-    gpio_close(&radio->tx_en);
-    gpio_close(&radio->rx_en);
-    gpio_close(&radio->dio1);
-    gpio_close(&radio->busy);
-    gpio_close(&radio->rst);
-    gpio_close(&radio->cs);
-
-    if (radio->spi_fd >= 0)
-        close(radio->spi_fd);
-
-    if (radio->condition_ready)
-        pthread_cond_destroy(&radio->condition);
-
-    if (radio->mutex_ready)
-        pthread_mutex_destroy(&radio->mutex);
-
-    free(radio);
+    if (r->fd >= 0) close(r->fd);
+    if (r->wake[0] >= 0) close(r->wake[0]);
+    if (r->wake[1] >= 0) close(r->wake[1]);
+    pthread_cond_destroy(&r->condition);
+    pthread_mutex_destroy(&r->mutex);
+    free(r);
 }

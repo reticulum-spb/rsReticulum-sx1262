@@ -1,95 +1,144 @@
 # rsReticulum SX1262 plugin
 
-C11 plugin for direct use of an SPI SX1262 radio by `rsReticulum`. It uses the
-stable ABI from `rsReticulum/crates/rns-plugin` and keeps the RNode over-air
-format: one header byte, a four-bit packet sequence and two-frame fragmentation
-for Reticulum packets up to 500 bytes.
+C11 plugin connecting `rsReticulum` to the **sx1262-linux** kernel driver through
+`/dev/loraN`. RNode air framing is unchanged: one header byte, a four-bit sequence
+and up to two LoRa frames for a Reticulum packet of at most 500 bytes.
 
-`include/rns_plugin.h` is a byte-for-byte vendored copy of
-`rsReticulum/crates/rns-plugin/include/rns_plugin.h`. It is intentionally kept
-inside this repository so the plugin can be built without a neighbouring
-rsReticulum source checkout.
-
-Each plugin instance owns its SPI descriptor, GPIO chips and lines, IRQ thread,
-radio state and reassembly buffer. Multiple configured interfaces therefore do
-not share mutable state. `rx_en` and `tx_en` are optional.
+SPI, GPIO, IRQ, TCXO, PA configuration and radio recovery belong to the kernel
+driver and Device Tree. This plugin does not open spidev or GPIO devices.
+Each instance exclusively opens one LoRa device and owns its event worker,
+TX completion state and reassembly buffer.
 
 ## Build
 
-Dependencies: CMake 3.16+, a C11 compiler, pthreads, libm, libcyaml 2.x and
-libgpiod 1.x. The libgpiod 2.x API is deliberately rejected at configure time.
+Dependencies: Linux, CMake 3.16+, C11 compiler, pthreads, libm and libcyaml 1.4.2 or 2.x.
+libgpiod is no longer required.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
 cmake --build build
 ctest --test-dir build --output-on-failure
 sudo cmake --install build
 ```
 
-The installed filename is `sx1262.so`, without a `lib` prefix. The default
-GNU installation path is `/usr/local/lib/reticulum-rs`; rsReticulum normally
-loads `/usr/lib/reticulum-rs/sx1262.so`, so use `-DCMAKE_INSTALL_PREFIX=/usr`
-when appropriate.
+The installed filename is `sx1262.so`, without a `lib` prefix, normally in
+`/usr/lib/reticulum-rs`. The host ABI header `include/rns_plugin.h` is vendored
+from rsReticulum. `include/sx1262_uapi.h` is an unmodified copy of ABI version 2
+from sx1262-linux (`include/uapi/linux/sx1262.h`, Linux-syscall-note license).
+Neither neighbouring checkout is required to build the plugin.
 
-## Configuration
+## Configuration and migration
 
-The plugin embeds an ABI 1.1 JSON Schema for its complete configuration. Its
-readable source is `schema/schema.json`; CMake converts it to a byte
-array in the build directory and compiles that into `sx1262.so`, without extra
-build-time tools. The rsReticulum web UI reads this metadata directly from the
-library and builds the editor from it; there is no host-side fallback or
-SX1262-specific form.
+See `example.yaml`. Required fields: `device`, `frequency`, `bandwidth`,
+`spreading_factor`, `coding_rate`, `tx_power`. Unknown keys are rejected.
+Replace the old `spi`, `cs`, `rst`, `busy`, `dio1`, `rx_en`, `tx_en` and
+`tcxo_voltage` fields with `device: /dev/lora0`. Hardware settings now belong
+in Device Tree. Numbering follows driver probe order; a stable device symlink
+can be used. The process needs read/write permission (driver default: `0600`).
+Two interfaces cannot open the same radio.
 
-See `example.yaml`. Required plugin fields are `spi`, `cs`, `rst`, `busy`,
-`dio1`, `frequency`, `bandwidth`, `spreading_factor`, `coding_rate` and
-`tx_power`. Unknown keys are rejected.
+| Optional field | Default | Meaning |
+| --- | ---: | --- |
+| `rx_preamble_symbols` | 65 | RX acquisition window; minimum 12 at SF5/6, otherwise 4; maximum 65535 |
+| `tx_preamble_symbols` | 25 | Minimum 12 at SF5/6, otherwise 4; maximum 65535 |
+| `sync_word` | 5156 | `0x1424` |
+| `irq_watchdog_seconds` | 60 | Kernel silence watchdog, 1–86400 seconds |
+| `hard_reset_after` | 2 | Kernel recovery threshold, 1–100 |
+| `tx_timeout_seconds` | 120 | Userspace wait for an accepted batch, 1–86400 seconds |
 
-Supported bandwidths are 7800, 10400, 15600, 20800, 31250, 41700, 62500,
-125000, 250000 and 500000 Hz. Spreading factor is 5–12, coding rate is 4–8,
-and TX power is 8–30 dBm (the PA setup follows the E22 M30S tuning used by
-RNode-linux).
+SF is 5–12; CR is the denominator 5–8 (CR=4 is no longer accepted).
+Bandwidths: 7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000,
+250000 and 500000 Hz. The parser permits TX power −9..30 dBm; the driver
+validates it and frequency against the actual DT hardware profile. For E22 M30S
+this is normally 8..30 dBm. PHY combinations exceeding the driver's airtime
+limit are rejected by `SET_CONFIG`.
 
-Optional fields and defaults:
+The plugin explicitly selects CRC on, normal IQ, explicit header and **LDRO off**
+(`ldro=1` in the driver ABI), matching the previous plugin. It does not inherit
+these settings from a previous process. Bitrate is reported to the host at startup.
+The embedded JSON Schema describes the new configuration for the rsReticulum UI.
 
-| Field | Default |
-| --- | ---: |
-| `rx_en`, `tx_en` | absent |
-| `preamble_symbols` | 25 |
-| `sync_word` | `0x1424` (write `5156` in YAML) |
-| `tcxo_voltage` | 1.8 V |
-| `irq_watchdog_seconds` | 60 |
-| `hard_reset_after` | 2 |
+## TX, RX and recovery
 
-Allowed TCXO voltages are 1.6, 1.7, 1.8, 2.2, 2.4, 2.7, 3.0 and 3.3 V.
+A whole Reticulum packet is submitted using one `TX_BATCH` with a unique cookie.
+`send()` succeeds only after a matching TX event reports status zero and all
+frames sent. Queue acceptance alone is not success. Partial completion, a
+failure to return to RX, or a submission error returns an error to the host.
+There is no automatic retry and no per-batch cancellation.
 
-The receive watchdog derives separate PREAMBLE and HEADER deadlines from the
-configured LoRa airtime. On expiry it first polls the SX1262 IRQ register, so a
-packet is still handled when only the DIO1 edge was lost. With no pending IRQ,
-the plugin restarts continuous RX without resetting the chip. After
-`hard_reset_after` consecutive watchdog recoveries, or immediately after a
-failed soft recovery or TX timeout, it toggles RST and reapplies the complete
-radio configuration. A normal DIO1 event clears the recovery counter.
+There is at most one outstanding batch per instance. When the userspace wait
+expires, `send()` returns an error but the accepted batch **may still transmit**.
+New sends are rejected until its completion is consumed. The event worker marks
+the interface offline while an expired batch remains outstanding, logs the late
+result and restores availability when the driver is online. An unrelated cookie
+cannot release the outstanding batch. Increasing `tx_timeout_seconds` may be
+needed with slow PHY settings or several radios sharing the global TX queue.
+The timeout includes queue wait; it is not a physical TX deadline.
 
-`irq_watchdog_seconds` additionally checks a radio which produces no DIO1
-events at all. The valid range is 1–86400 seconds; `hard_reset_after` is 1–100.
-During a hardware reset the interface transitions offline and returns online
-only after radio initialization succeeds.
+RX and TX events are consumed by one worker. RX frames are reassembled into
+Reticulum packets; RSSI is converted from half-dBm units with truncation toward
+zero and SNR from quarter-dB units with nearest rounding, preserving the previous
+plugin's conversions. `GET_STATS` tracks driver online/offline status at roughly
+100 ms intervals. Recovery is performed by the driver, not userspace resets.
+Device removal or an invalid event ABI stops the worker and leaves the interface
+offline; recreating the interface is required after rebind.
 
-## Runtime behaviour
+Shutdown marks the interface offline, wakes and joins the event worker, then
+closes the device. Driver close cancels any remaining session work. The host
+joins its TX worker before destroying the plugin, so shutdown can first wait
+up to the configured send timeout (plus kernel operation/scheduling delays).
 
-`send()` waits for physical `TX_DONE` for every LoRa fragment and uses finite
-timeouts. The IRQ worker receives continuously and reports complete packets
-with rounded RSSI and SNR metadata. `destroy()` first reports the interface
-offline, stops and joins the IRQ worker, disables optional RF switches, and
-releases every descriptor and GPIO resource.
+## Access to the medium
 
-Tests exercise framing/reassembly, strict YAML parsing and dynamic ABI loading
-without radio hardware. SPI/GPIO operation and RF compatibility must also be
-validated on the target board.
+The updated sx1262-linux driver waits for an already detected RX to finish,
+then applies a random backoff of 0..336 ms in 24 ms slots and checks RX again.
+The access deadline is twice the configured maximum-frame airtime plus 1000 ms.
+On expiry it completes the batch with `-EBUSY` and zero frames sent; that batch
+will not transmit later. IRQ handling and RX watchdog continue during this wait.
+There is no added contention delay between frames in one batch.
+
+This is not CAD or full carrier sensing: undetected signals and hidden nodes
+can still collide. All driver radios share one ordered TX queue. ABI version 2
+is unchanged: the plugin also works with the earlier driver, but that driver
+does not provide the new RX-aware backoff policy.
+
+## Tests
+
+Host tests cover framing, YAML parsing, dynamic ABI loading, and a fake Linux
+record device driving the actual event thread. Backend tests exercise batching,
+RX metadata, partial/error completion, queue rejection, timeout, late/wrong-cookie
+completion, online recovery and device removal. No radio is needed for these.
+
+For a manual ABI integration test, build with `-DBUILD_HARDWARE_TEST=ON` and run:
+
+```sh
+./build/hardware_test /usr/lib/reticulum-rs/sx1262.so radio.yaml rx
+./build/hardware_test /usr/lib/reticulum-rs/sx1262.so radio.yaml tx
+```
+
+`radio.yaml` contains only the plugin mapping (no `interfaces:` wrapper).
+`rx` opens the radio for five seconds; `tx` transmits 1/254/255/500-byte packets.
+The `late` mode needs `tx_timeout_seconds: 1` and PHY settings where a 500-byte
+packet takes longer than one second; it checks rejection while pending and
+restored availability after the late completion. TX modes emit real RF.
+The hardware test is deliberately not registered with CTest.
+
+On hardware check both 254-byte and 500-byte Reticulum packets in both directions
+against an existing RNode, two radios contending for the global queue, RX during
+backoff, a stuck RX/watchdog recovery, and a deliberately short userspace TX
+wait followed by late completion. Confirm the newer driver rejects sustained
+busy-medium attempts with zero frames sent. RF compatibility, timing and power
+must be checked on the target board; host tests do not establish them.
 
 ## Origin and license
 
-The SX126x register sequence and RNode air framing are derived from
-`RNode-linux`, copyright 2025 Belousov Oleg (R1CBU). This project is licensed
-under LGPL-2.1-or-later, matching that source project. SPDX identifier:
-`LGPL-2.1-or-later`.
+RNode air framing is derived from RNode-linux, copyright 2025 Belousov Oleg
+(R1CBU). Plugin license: LGPL-2.1-or-later. The kernel UAPI header retains its
+own SPDX identifier, GPL-2.0 WITH Linux-syscall-note.
+
+Version 0.3 requires sx1262-linux ABI 2 (44-byte configuration). Upgrade the
+module and plugin together. Replace the old `preamble_symbols` key with
+`tx_preamble_symbols` and set `rx_preamble_symbols` to the longest peer preamble
+(default 65). The old key is rejected to avoid silently losing its value.
+RX preamble affects RX/header acquisition and medium-access waits; TX preamble
+affects transmitted packets and TX airtime only. They need not be equal.

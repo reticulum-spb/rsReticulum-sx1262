@@ -6,18 +6,12 @@
 #include <stdint.h>
 
 typedef struct {
-    uint8_t port;
-    uint8_t pin;
-} gpio_config_t;
-
-typedef struct {
-    char          *spi;
-    gpio_config_t  cs, rst, busy, dio1;
-    gpio_config_t *rx_en, *tx_en;
-    uint32_t       frequency, bandwidth, preamble_symbols;
-    uint8_t        spreading_factor, coding_rate, tx_power;
+    char          *device;
+    uint32_t       frequency, bandwidth, tx_preamble_symbols, rx_preamble_symbols;
+    uint8_t        spreading_factor, coding_rate;
+    int32_t        tx_power;
     uint16_t       sync_word;
-    double         tcxo_voltage;
+    uint32_t       tx_timeout_seconds;
     uint32_t       irq_watchdog_seconds;
     uint8_t        hard_reset_after;
 } plugin_config_t;
